@@ -30,7 +30,7 @@ the apply order.
 calls `generate_patches_from_series(..., resolve=True)`, which resolves only the entries it is
 given; an unlisted file is never applied and nothing warns you. The build succeeds and produces a
 binary identical to an unpatched one. `.github/workflows/lint-patches.yml` exists solely to catch
-this — it runs `devutils/check_patch_files.sh`, whose `check_unused_patches` walks `patches/`
+this — it runs the submodule's `check_patch_files.py`, whose `check_unused_patches` walks `patches/`
 and fails on any file missing from `series`. `.md` files are exempt, which is why this README
 needs no entry.
 

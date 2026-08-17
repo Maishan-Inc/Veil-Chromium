@@ -6,11 +6,11 @@
 # The build succeeds, the binary is byte-identical to an unpatched one, and nothing anywhere says
 # the patch did not run. That is the single cheapest way to lose a day in Stage 5.
 #
-# `devutils/check_patch_files.sh` (already in the fork, from upstream) wraps the submodule's
-# `ungoogled-chromium/devutils/check_patch_files.py` and checks three things over `patches/`:
+# The check itself is the submodule's `ungoogled-chromium/devutils/check_patch_files.py`, which
+# upstream's four-line `devutils/check_patch_files.sh` wraps. Over a patches directory it checks:
 #   * every entry in `series` names a file that exists and parses as a unified diff
 #   * no entry appears in `series` twice
-#   * no file under `patches/` is absent from `series`   <- the trap
+#   * no file under the directory is absent from `series`   <- the trap
 # It ignores `.md` files, so `patches/veil/README.md` does not need a series entry.
 #
 # `devutils/validate_patches.py` (submodule) is deliberately NOT wired in here. It checks that
@@ -19,7 +19,7 @@
 # the submodule's own series. Running it against pristine source reports false conflicts. Use it
 # locally against an already-patched tree instead:
 #
-#   ./ungoogled-chromium/devutils/validate_patches.py -l build/src -s patches/series -p patches
+#   python3 ungoogled-chromium/devutils/validate_patches.py -l build/src -s patches/series -p patches
 #
 # This job is cheap (submodule checkout + Python, no Chromium source), so it runs on every push.
 name: lint-patches
@@ -47,13 +47,20 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Invoked through `python3` rather than as `./devutils/check_patch_files.sh`, because upstream
+      # stores every `devutils/*.sh` with mode 100644 — no executable bit — and never calls them from
+      # CI, so nobody upstream ever hit it. Running the wrapper directly fails with
+      # "Permission denied" and exit 126. The wrapper is four lines and does exactly this call, so
+      # bypassing it costs nothing and removes the whole exec-bit failure class. (The submodule's
+      # `.py` files are 100755, but relying on that would be relying on the same assumption twice.)
+      #
       # This repo's series: 23 upstream windows patches + patches/veil/*.
       - name: check_patch_files (fork series)
-        run: ./devutils/check_patch_files.sh
+        run: python3 ungoogled-chromium/devutils/check_patch_files.py -p patches
 
       # The submodule's own series, so a bad submodule bump is caught here too.
       - name: check_patch_files (ungoogled submodule series)
-        run: ./ungoogled-chromium/devutils/check_patch_files.py -p ungoogled-chromium/patches
+        run: python3 ungoogled-chromium/devutils/check_patch_files.py -p ungoogled-chromium/patches
 
       # `package.py` derives the release asset name from these three files, not from the git tag.
       # A tag that disagrees with them produces a release whose assets are named for a different
