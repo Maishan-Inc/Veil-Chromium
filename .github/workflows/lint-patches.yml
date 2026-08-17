@@ -1,0 +1,73 @@
+# Veil-Chromium — patch-series lint
+#
+# New in the fork. Upstream has no lint workflow, and the failure mode it exists to catch is
+# silent: `build.py` calls `generate_patches_from_series(..., resolve=True)`, so a `.patch` file
+# sitting in `patches/veil/` that is NOT listed in `patches/series` is skipped without a warning.
+# The build succeeds, the binary is byte-identical to an unpatched one, and nothing anywhere says
+# the patch did not run. That is the single cheapest way to lose a day in Stage 5.
+#
+# `devutils/check_patch_files.sh` (already in the fork, from upstream) wraps the submodule's
+# `ungoogled-chromium/devutils/check_patch_files.py` and checks three things over `patches/`:
+#   * every entry in `series` names a file that exists and parses as a unified diff
+#   * no entry appears in `series` twice
+#   * no file under `patches/` is absent from `series`   <- the trap
+# It ignores `.md` files, so `patches/veil/README.md` does not need a series entry.
+#
+# `devutils/validate_patches.py` (submodule) is deliberately NOT wired in here. It checks that
+# patches apply against a *pristine* Chromium tree, but everything in this repo's `patches/`
+# series — the 23 upstream windows patches and every Veil patch — is written to apply on top of
+# the submodule's own series. Running it against pristine source reports false conflicts. Use it
+# locally against an already-patched tree instead:
+#
+#   ./ungoogled-chromium/devutils/validate_patches.py -l build/src -s patches/series -p patches
+#
+# This job is cheap (submodule checkout + Python, no Chromium source), so it runs on every push.
+name: lint-patches
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-patch-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # This repo's series: 23 upstream windows patches + patches/veil/*.
+      - name: check_patch_files (fork series)
+        run: ./devutils/check_patch_files.sh
+
+      # The submodule's own series, so a bad submodule bump is caught here too.
+      - name: check_patch_files (ungoogled submodule series)
+        run: ./ungoogled-chromium/devutils/check_patch_files.py -p ungoogled-chromium/patches
+
+      # `package.py` derives the release asset name from these three files, not from the git tag.
+      # A tag that disagrees with them produces a release whose assets are named for a different
+      # version — see overlay/README.md → "Version and tag scheme".
+      - name: Report the version the build will produce
+        run: |
+          set -euo pipefail
+          chromium_version="$(cat ungoogled-chromium/chromium_version.txt)"
+          release_revision="$(cat ungoogled-chromium/revision.txt)"
+          packaging_revision="$(cat revision.txt)"
+          version="${chromium_version}-${release_revision}.${packaging_revision}"
+          echo "package.py will name assets: ungoogled-chromium_${version}_windows_x64.zip"
+          echo "expected tag:                ${version}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the version the build will produce (${version}). Fix revision.txt or the tag."
+            exit 1
+          fi

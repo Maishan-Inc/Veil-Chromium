@@ -1,11 +1,33 @@
+# Veil-Chromium — publish-release
+#
+# Forked from ungoogled-software/ungoogled-chromium-windows @ 151.0.7922.137-1.1 and trimmed for
+# Veil, which is Windows-x64-only. Differences from upstream, all deliberate:
+#
+#   1. `build-x86` / `build-arm` removed from the trigger list, from the workflow table in
+#      `resolve-release-context`, and from the artifact downloads. Upstream sets
+#      `publishable=false` when ANY of the three architectures lacks a successful run at the
+#      target SHA, so an x64-only fork that kept them would build for a day and publish nothing,
+#      with no error logged anywhere.
+#   2. `publish-winget` deleted. It hardcodes upstream's winget identifier
+#      (`eloston.ungoogled-chromium`) and fork user (`Nifury`), needs `secrets.PAT`, and runs on
+#      `ubuntu-slim` — a non-standard runner label that queues forever on a fork rather than
+#      failing. Publishing to winget under upstream's identifier would also be wrong.
+#   3. `update-binaries` deleted. Upstream bookkeeping against
+#      `Nifury/ungoogled-chromium-binaries`, and a second `secrets.PAT` consumer.
+#   4. `SHA256SUMS` plus an optional detached GPG signature is generated and published. Veil's
+#      downloader does not need it — `checksum_source = "asset_digest"` uses the GitHub API's
+#      per-asset digest — but users must be able to verify independently of GitHub.
+#
+# NOT changed, on purpose: the `run.event === 'push'` filter in the script and the job-level
+# `github.event.workflow_run.event == 'push'` guard. A build started with `workflow_dispatch`
+# will not satisfy them, so validate the pipeline by pushing a tag. `workflow_dispatch` stays as
+# a manual escape hatch for re-publishing an already-built tag.
 name: publish-release
 on:
   workflow_dispatch:
   workflow_run:
     workflows:
       - build-x64
-      - build-x86
-      - build-arm
     types:
       - completed
 
@@ -27,14 +49,11 @@ jobs:
       target_tag: ${{ steps.context.outputs.target_tag }}
       target_sha: ${{ steps.context.outputs.target_sha }}
       x64_run_id: ${{ steps.runs.outputs.x64_run_id }}
-      x86_run_id: ${{ steps.runs.outputs.x86_run_id }}
-      arm_run_id: ${{ steps.runs.outputs.arm_run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
       - name: Fetch tags
         run: git fetch --force --tags origin
 
@@ -91,7 +110,7 @@ jobs:
           echo "Resolved tag: $target_tag"
           echo "Resolved sha: $target_sha"
 
-      - name: Locate latest successful builds
+      - name: Locate latest successful build
         id: runs
         if: ${{ steps.context.outputs.ready == 'true' }}
         uses: actions/github-script@v9
@@ -99,10 +118,10 @@ jobs:
           TARGET_SHA: ${{ steps.context.outputs.target_sha }}
         with:
           script: |
+            // x64 only. Upstream iterated build-x64/x86/arm and set publishable=false if any
+            // one of them was missing at the target SHA — see the header of this file.
             const workflows = [
               { key: 'x64', file: 'build-x64.yml' },
-              { key: 'x86', file: 'build-x86.yml' },
-              { key: 'arm', file: 'build-arm.yml' },
             ];
             const targetSha = process.env.TARGET_SHA;
             const outputs = { publishable: 'true' };
@@ -133,7 +152,7 @@ jobs:
               matches.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
               const latest = matches[0];
               if (!latest) {
-                core.info(`No successful run found for ${workflow.file} at ${targetSha}`);
+                core.info(`No successful push-triggered run found for ${workflow.file} at ${targetSha}`);
                 outputs.publishable = 'false';
                 continue;
               }
@@ -145,7 +164,6 @@ jobs:
             for (const [name, value] of Object.entries(outputs)) {
               core.setOutput(name, value);
             }
-
   publish-release:
     needs: resolve-release-context
     if: ${{ needs.resolve-release-context.outputs.ready == 'true' && needs.resolve-release-context.outputs.publishable == 'true' }}
@@ -160,23 +178,40 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.resolve-release-context.outputs.x64_run_id }}
 
-      - name: Download x86 package
-        uses: actions/download-artifact@v8
-        with:
-          name: chromium-x86
-          path: artifacts/x86
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.resolve-release-context.outputs.x86_run_id }}
+      # Names come from `package.py`, which builds them from `chromium_version.txt` +
+      # `ungoogled-chromium/revision.txt` + `revision.txt` — NOT from the git tag. If the tag and
+      # the asset names disagree, `revision.txt` is out of step with the tag you pushed.
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          find . -type f ! -name 'SHA256SUMS*' -printf '%P\n' | sort | while read -r f; do
+            (cd "$(dirname "$f")" && sha256sum "$(basename "$f")")
+          done > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Download arm package
-        uses: actions/download-artifact@v8
-        with:
-          name: chromium-arm
-          path: artifacts/arm
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.resolve-release-context.outputs.arm_run_id }}
+      # Optional: publishes an unsigned SHA256SUMS when no key is configured, rather than
+      # failing the release. Set the VEIL_GPG_PRIVATE_KEY secret (armored private key) and
+      # VEIL_GPG_PASSPHRASE to turn signing on.
+      - name: Sign SHA256SUMS
+        id: sign
+        working-directory: artifacts
+        env:
+          VEIL_GPG_PRIVATE_KEY: ${{ secrets.VEIL_GPG_PRIVATE_KEY }}
+          VEIL_GPG_PASSPHRASE: ${{ secrets.VEIL_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VEIL_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::warning::VEIL_GPG_PRIVATE_KEY is not set; publishing SHA256SUMS unsigned."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s' "$VEIL_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          gpg --batch --yes --pinentry-mode loopback \
+            ${VEIL_GPG_PASSPHRASE:+--passphrase "$VEIL_GPG_PASSPHRASE"} \
+            --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -186,79 +221,4 @@ jobs:
           overwrite_files: true
           files: |
             artifacts/**/ungoogled-chromium*
-
-  publish-winget:
-    needs:
-      - resolve-release-context
-      - publish-release
-    if: ${{ needs.resolve-release-context.outputs.ready == 'true' && needs.resolve-release-context.outputs.publishable == 'true' }}
-    runs-on: ubuntu-slim
-    steps:
-      - name: Get version
-        id: version
-        run: echo "version=$(echo '${{ needs.resolve-release-context.outputs.target_tag }}' | cut -d'-' -f1)" >> $GITHUB_OUTPUT
-      - uses: vedantmgoyal9/winget-releaser@main
-        with:
-          identifier: eloston.ungoogled-chromium
-          token: ${{ secrets.PAT }}
-          installers-regex: .(exe|zip)$
-          version: ${{ steps.version.outputs.version }}
-          release-tag: ${{ needs.resolve-release-context.outputs.target_tag }}
-          fork-user: Nifury
-
-  update-binaries:
-    needs:
-      - resolve-release-context
-      - publish-release
-    if: ${{ needs.resolve-release-context.outputs.ready == 'true' && needs.resolve-release-context.outputs.publishable == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout ungoogled-chromium-windows
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.resolve-release-context.outputs.target_tag }}
-          path: ungoogled-chromium-windows
-      - name: Checkout ungoogled-chromium-binaries
-        uses: actions/checkout@v7
-        with:
-          repository: Nifury/ungoogled-chromium-binaries
-          token: ${{ secrets.PAT }}
-          path: ungoogled-chromium-binaries
-      - name: Rebase onto upstream master
-        working-directory: ungoogled-chromium-binaries
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git remote add upstream https://github.com/ungoogled-software/ungoogled-chromium-binaries.git
-          git fetch upstream
-          git rebase upstream/master
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install requests
-      - name: Run gen.py
-        working-directory: ungoogled-chromium-binaries
-        env:
-          RELEASE_TAG: ${{ needs.resolve-release-context.outputs.target_tag }}
-        run: python ../ungoogled-chromium-windows/.github/scripts/gen.py
-      - name: Commit and push
-        working-directory: ungoogled-chromium-binaries
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add config/platforms/windows/
-          git commit -m "Update Windows binaries for ${{ needs.resolve-release-context.outputs.target_tag }}"
-          git push --force-with-lease
-      - name: Create pull request
-        working-directory: ungoogled-chromium-binaries
-        run: |
-          gh pr create \
-            --repo ungoogled-software/ungoogled-chromium-binaries \
-            --head Nifury:master \
-            --base master \
-            --title "Update Windows binaries for ${{ needs.resolve-release-context.outputs.target_tag }}" \
-            --body "Automated update of Windows binary hashes for release ${{ needs.resolve-release-context.outputs.target_tag }}."
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
+            artifacts/SHA256SUMS*
