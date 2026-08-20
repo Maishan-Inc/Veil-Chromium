@@ -28,3 +28,4 @@ veil/010-headless.patch
 veil/018-timezone.patch
 veil/003-audio-fingerprint.patch
 veil/012-canvas-get-image-data.patch
+veil/015-canvas-measure-text.patch
