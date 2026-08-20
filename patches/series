@@ -30,3 +30,4 @@ veil/003-audio-fingerprint.patch
 veil/012-canvas-get-image-data.patch
 veil/015-canvas-measure-text.patch
 veil/013-canvas-toDataURL.patch
+veil/006-font-fingerprint.patch
