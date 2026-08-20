@@ -26,3 +26,4 @@ veil/005-hardware-concurrency-fingerprint.patch
 veil/009-webdriver.patch
 veil/010-headless.patch
 veil/018-timezone.patch
+veil/003-audio-fingerprint.patch
