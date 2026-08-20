@@ -1,0 +1,72 @@
+# Origin:  adryfish/fingerprint-chromium
+# Source:  patches/extra/fingerprint/007-shadow-root.patch
+# Commit:  831623f2965e34554304caabfc3a1e4e3741db1f (tag 144.0.7559.132)
+# License: BSD-3-Clause (see CREDITS.md)
+# Changes: regenerated against the post-series 151.0.7922.137 tree. element.h's hunk landed with
+#          fuzz 2 -- GNU patch's maximum, and the most suspect application in the whole Tier 1 set --
+#          because 151 turned GetShadowRoot() from a declaration into an ALWAYS_INLINE inline
+#          definition, replacing one context line with four. The fuzzy outcome was read back and was
+#          correct (the declaration lands between OpenShadowRoot and ClosedShadowRoot, where the
+#          patch puts it), then regenerated with diff -u. element.cc (+2035) and element.idl (+16)
+#          applied unchanged; those are offsets, not fuzz.
+#
+# Adds Element.fakeShadowRoot: an IDL attribute backed by Element::FakeShadowRoot(), which returns
+# GetShadowRoot() -- the shadow root regardless of mode, so a CLOSED root becomes reachable from
+# script. element.shadowRoot keeps its spec behaviour of returning null for a closed root.
+#
+# Measured 2026-08-21, control binary vs this build, with NO switches on either command line:
+#
+#                                       control        patched
+#   'fakeShadowRoot' in Element.prototype   false        true
+#   closed root via element.shadowRoot      null         null   (spec, unchanged)
+#   closed root via element.fakeShadowRoot  absent       === the closed root
+#   getter source                           --           [native code]
+#   getOwnPropertyNames(Element.prototype)  shadowRoot,  shadowRoot, fakeShadowRoot,
+#                                           attachShadow attachShadow
+#
+# The detection baseline does not probe shadow roots at all, so this was verified out of band with
+# --headless=new --dump-dom against a local page, the same way 009 and 010 were. The baseline was
+# still captured, and confirmed that no probed surface moves.
+#
+# WARNING: this patch does not remove a fingerprint surface, it ADDS one, and
+# it is not gated on --fingerprint or on anything else. On the control binary
+# 'fakeShadowRoot' in Element.prototype is false and Object.getOwnPropertyNames(Element.prototype)
+# contains only shadowRoot and attachShadow; with this patch the property exists unconditionally, in
+# every profile, and is a single-expression tell that no stock Chromium has. It is kept because
+# Stage 5 ports faithfully, but see Veil/docs/MIGRATION-UNGOOGLED.md 5.1k: whether Veil ships it at
+# all is an open decision, alongside the same question for 010.
+#
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -7837,6 +7837,11 @@
+   return root && root->GetMode() == ShadowRootMode::kOpen ? root : nullptr;
+ }
+ 
++ShadowRoot* Element::FakeShadowRoot() const {
++  ShadowRoot* root = GetShadowRoot();
++  return root;
++}
++
+ ShadowRoot* Element::ClosedShadowRoot() const {
+   ShadowRoot* root = GetShadowRoot();
+   if (!root) {
+--- a/third_party/blink/renderer/core/dom/element.h
++++ b/third_party/blink/renderer/core/dom/element.h
+@@ -1098,6 +1098,7 @@
+     return HasShadowRoot() ? GetShadowRootInternal() : nullptr;
+   }
+   ShadowRoot* OpenShadowRoot() const;
++  ShadowRoot* FakeShadowRoot() const;
+   ShadowRoot* ClosedShadowRoot() const;
+   ShadowRoot* AuthorShadowRoot() const;
+   ShadowRoot* UserAgentShadowRoot() const;
+--- a/third_party/blink/renderer/core/dom/element.idl
++++ b/third_party/blink/renderer/core/dom/element.idl
+@@ -81,6 +81,7 @@
+ 
+     [RaisesException, MeasureAs=ElementAttachShadow] ShadowRoot attachShadow(ShadowRootInit shadowRootInitDict);
+     [PerWorldBindings, ImplementedAs=OpenShadowRoot] readonly attribute ShadowRoot? shadowRoot;
++    [PerWorldBindings, ImplementedAs=FakeShadowRoot] readonly attribute ShadowRoot? fakeShadowRoot;
+ 
+     [RaisesException] Element? closest(DOMString selectors);
+     [RaisesException] boolean matches(DOMString selectors);
