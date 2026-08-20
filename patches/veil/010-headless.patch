@@ -1,0 +1,25 @@
+# Origin:  adryfish/fingerprint-chromium
+# Source:  patches/extra/fingerprint/010-headless.patch
+# Commit:  831623f2965e34554304caabfc3a1e4e3741db1f (tag 144.0.7559.132)
+# License: BSD-3-Clause (see CREDITS.md)
+# Changes: none — applies unmodified (offset 9 lines).
+#
+# Renames the headless product name from "HeadlessChrome" to "Chrome", so a --headless run no
+# longer announces itself in the default user agent.
+#
+# Only reachable in headless mode, so a headed capture cannot see it. Verify by reading the
+# DevTools /json/version "Browser" field from a headless launch — no CDP evaluation needed.
+
+diff --git a/headless/lib/browser/headless_browser_impl.cc b/headless/lib/browser/headless_browser_impl.cc
+index 560bdba320..dd52c27101 100644
+--- a/headless/lib/browser/headless_browser_impl.cc
++++ b/headless/lib/browser/headless_browser_impl.cc
+@@ -55,7 +55,7 @@ namespace headless {
+ namespace {
+ 
+ // Product name for building the default user agent string.
+-const char kHeadlessProductName[] = "HeadlessChrome";
++const char kHeadlessProductName[] = "Chrome";
+ 
+ #if defined(HEADLESS_USE_PREFS)
+ const base::FilePath::CharType kLocalStateFilename[] =

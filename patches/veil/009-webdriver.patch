@@ -1,0 +1,27 @@
+# Origin:  adryfish/fingerprint-chromium
+# Source:  patches/extra/fingerprint/009-webdriver.patch
+# Commit:  831623f2965e34554304caabfc3a1e4e3741db1f (tag 144.0.7559.132)
+# License: BSD-3-Clause (see CREDITS.md)
+# Changes: none — applies unmodified (offset 1 line).
+#
+# navigator.webdriver. Deletes the early return that reports true whenever the
+# AutomationControlled runtime feature is enabled, leaving only the DevTools probe override.
+#
+# Not switch-gated, and invisible unless automation is actually on: a browser launched without
+# --enable-automation already reports false, so the detection baseline cannot see this patch.
+# Verify it with --enable-automation against a pre-patch control instead.
+
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 8bfa0a3763..3091179eab 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -99,9 +99,6 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
+-  if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+-    return true;
+-
+   bool automation_enabled = false;
+   probe::ApplyAutomationOverride(GetExecutionContext(), automation_enabled);
+   return automation_enabled;

@@ -22,3 +22,7 @@ ungoogled-chromium/windows/windows-fix-remove-unused-preferences-fields.patch
 ungoogled-chromium/windows/windows-fix-missing-includes.patch
 ungoogled-chromium/windows/windows-fix-unsupported-llvm-flags.patch
 veil/000-add-fingerprint-switches.patch
+veil/005-hardware-concurrency-fingerprint.patch
+veil/009-webdriver.patch
+veil/010-headless.patch
+veil/018-timezone.patch
