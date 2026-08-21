@@ -1,0 +1,264 @@
+# Origin:  adryfish/fingerprint-chromium
+# Source:  patches/extra/fingerprint/014-client-rects.patch
+# Commit:  831623f2965e34554304caabfc3a1e4e3741db1f (tag 144.0.7559.132)
+# License: BSD-3-Clause (see CREDITS.md)
+# Changes: regenerated against the post-series 151.0.7922.137 tree with 007 already applied. Three
+#          hunks needed it and the rest applied unchanged:
+#            * element.cc #1 failed outright -- 151 added
+#              components/viz/common/surfaces/tracked_element_rects.h and
+#              third_party/blink/public/mojom/scroll/scroll_enums.mojom-blink.h to the include block.
+#            * document.cc #1 and #3 landed with fuzz 2. Both outcomes were read back and were
+#              correct (base/command_line.h after base/auto_reset.h, ungoogled_switches.h between
+#              cc/input/scroll_snap_data.h and mojo/.../wtf_hash_util.h, and the noise-factor block
+#              replacing the RuntimeEnabledFeatures one in the Document constructor), then
+#              regenerated with diff -u.
+#          Forward-applied to a pristine scratch copy afterwards to confirm zero fuzz and zero
+#          offset, since the build tree already carried the result.
+#
+# getClientRects / getBoundingClientRect noise, driven by --fingerprint=<seed>. It repurposes
+# ungoogled's Document::noise_factor_{x,y}_ from a multiplicative factor (1 +/- 1.5e-6, randomised
+# per Document with base::RandDouble) into a seed-derived ADDITIVE offset:
+# hash("<seed>offset_x") mapped to [-0.5, 0.5] and scaled by 0.002, i.e. +/-0.001 px. Element and
+# Range apply it with rect.Offset(...) / quad.Offset(...) instead of Scale(...), and QuadF gains an
+# Offset method that no-ops on a degenerate quad.
+#
+# Measured 2026-08-21, --fingerprint=7, against the zero-patch control in the same host state:
+#
+#   getClientRects()[0].x  0 -> 0.0005369044956751168     (main frame and cross-site iframe alike)
+#                      .y  0 -> 0.0004479514609556645
+#                  width   100      -> 100      unchanged
+#                  height  20       -> 20       unchanged
+#   seed 8      x = -0.00010738246055552736,  seed 424242  x = 0.0002731819695327431
+#
+# Deterministic, seed-derived, identical across realms. Three properties of the design are worth
+# knowing before anyone relies on it, all measured rather than inferred:
+#
+#   1. It is a CONSTANT TRANSLATION of the whole document, not per-element noise. Widths, heights
+#      and the difference between any two rects are bit-identical to the unpatched engine -- and
+#      those are what getClientRects fingerprinting actually reads.
+#   2. It is trivially detectable. Layout-derived rect coordinates in stock Chromium are LayoutUnit
+#      multiples of 1/64, so Number.isInteger(rect.x * 64) is true there and false here; on a
+#      margin:0 body, document.body.getBoundingClientRect().x is 0 upstream and 0.000536... here.
+#   3. ShouldSkipClientRectsOffset() exempts position:absolute elements whose top and left are zero
+#      or fixed, so a single page can compare an exempt element (quantised) against a static one
+#      (not) -- an internal contradiction that is a stronger signal than either half.
+#
+# Recorded, not fixed: see Veil/docs/MIGRATION-UNGOOGLED.md 5.1l.
+#
+# Note for anyone reading 015 next to this: 014 pairs a small value with an additive call, which is
+# correct. 015 computes the same kind of value and hands it to the MULTIPLICATIVE
+# TextMetrics::Shuffle, which is why measureText collapses -- see Veil/docs/MIGRATION-UNGOOGLED.md
+# 5.1h.
+#
+--- a/third_party/blink/renderer/core/dom/document.cc
++++ b/third_party/blink/renderer/core/dom/document.cc
+@@ -35,6 +35,7 @@
+ #include <utility>
+ 
+ #include "base/auto_reset.h"
++#include "base/command_line.h"
+ #include "base/containers/adapters.h"
+ #include "base/dcheck_is_on.h"
+ #include "base/debug/dump_without_crashing.h"
+@@ -49,6 +50,7 @@
+ #include "cc/animation/animation_timeline.h"
+ #include "cc/input/overscroll_behavior.h"
+ #include "cc/input/scroll_snap_data.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "mojo/public/cpp/bindings/lib/wtf_hash_util.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+@@ -1050,10 +1052,23 @@
+       data_(MakeGarbageCollected<DocumentData>(GetExecutionContext())) {
+   TRACE_EVENT("blink", "Document::Document", perfetto::Flow::FromPointer(this));
+   DCHECK(agent_);
+-  if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
+-    // Precompute -0.0003% to 0.0003% noise factor for get*ClientRect*() fingerprinting
+-    noise_factor_x_ = 1 + (base::RandDouble() - 0.5) * 0.000003;
+-    noise_factor_y_ = 1 + (base::RandDouble() - 0.5) * 0.000003;
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint)) {
++    std::string seed_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
++    // 为x和y使用不同的组合字符串
++    std::string combined_x = seed_str + "offset_x";
++    std::string combined_y = seed_str + "offset_y";
++
++    uint32_t hash_val_x = std::hash<std::string>{}(combined_x);
++    uint32_t hash_val_y = std::hash<std::string>{}(combined_y);
++
++    // 映射到[-0.5, 0.5]范围
++    double norm_x = (hash_val_x & 0xFFFFFFFF) / 4294967295.0 - 0.5;
++    double norm_y = (hash_val_y & 0xFFFFFFFF) / 4294967295.0 - 0.5;
++
++    // 计算很小的偏移量：±0.001像素
++    noise_factor_x_ = norm_x * 0.002;
++    noise_factor_y_ = norm_y * 0.002;
+   }
+   if (base::FeatureList::IsEnabled(features::kDelayAsyncScriptExecution) &&
+       features::kDelayAsyncScriptExecutionDelayByDefaultParam.Get()) {
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -32,9 +32,11 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "base/command_line.h"
+ #include "base/containers/adapters.h"
+ #include "base/feature_list.h"
+ #include "cc/input/snap_selection_strategy.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/surfaces/tracked_element_rects.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/mojom/scroll/scroll_enums.mojom-blink.h"
+@@ -3452,6 +3454,28 @@
+   }
+ }
+ 
++bool Element::ShouldSkipClientRectsOffset() const {
++  if (!GetLayoutObject() || !GetLayoutObject()->Style()) {
++    return false;
++  }
++
++  const ComputedStyle& style = *GetLayoutObject()->Style();
++
++  // 检查是否为绝对定位
++  if (style.GetPosition() != EPosition::kAbsolute) {
++    return false;
++  }
++
++  // 检查top和left是否都是"确定的"值（Zero或Fixed）
++  const Length& top = style.Top();
++  const Length& left = style.Left();
++
++  bool top_is_deterministic = top.IsZero() || top.IsFixed();
++  bool left_is_deterministic = left.IsZero() || left.IsFixed();
++
++  return (top_is_deterministic && left_is_deterministic);
++}
++
+ DOMRectList* Element::getClientRects() {
+   Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
+   if (rects.empty()) {
+@@ -3463,6 +3487,16 @@
+     GetDocument().AdjustRectForScrollAndAbsoluteZoom(rect,
+                                                      *element_layout_object);
+   }
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint) &&
++      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("clientrects") == std::string::npos)) {
++    if (!ShouldSkipClientRectsOffset()) {
++      for (auto& rect : rects) {
++        rect.Offset(GetDocument().GetNoiseFactorX(), GetDocument().GetNoiseFactorY());
++      }
++    }
++  }
+   return MakeGarbageCollected<DOMRectList>(rects);
+ }
+ 
+@@ -3512,8 +3546,13 @@
+   DCHECK(element_layout_object);
+   GetDocument().AdjustRectForScrollAndAbsoluteZoom(result,
+                                                    *element_layout_object);
+-  if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
+-    result.Scale(GetDocument().GetNoiseFactorX(), GetDocument().GetNoiseFactorY());
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint) &&
++      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("clientrects") == std::string::npos)) {
++    if (!ShouldSkipClientRectsOffset()) {
++      result.Offset(GetDocument().GetNoiseFactorX(), GetDocument().GetNoiseFactorY());
++    }
+   }
+   return result;
+ }
+--- a/third_party/blink/renderer/core/dom/element.h
++++ b/third_party/blink/renderer/core/dom/element.h
+@@ -633,6 +633,8 @@
+   // TODO(crbug.com/41417572): This method should replace the above method.
+   gfx::Rect VisibleBoundsRespectingClipsInLocalRoot() const;
+ 
++  bool ShouldSkipClientRectsOffset() const;
++
+   DOMRectList* getClientRects();
+   // Returns a list of clients Rects in zoomed pixel units.
+   Vector<gfx::RectF> GetClientRectsNoAdjustment();
+--- a/third_party/blink/renderer/core/dom/range.cc
++++ b/third_party/blink/renderer/core/dom/range.cc
+@@ -23,6 +23,8 @@
+  * Boston, MA 02110-1301, USA.
+  */
+ 
++#include "base/command_line.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "third_party/blink/renderer/core/dom/range.h"
+ 
+ #include "third_party/blink/renderer/core/display_lock/display_lock_document_state.h"
+@@ -1664,9 +1666,12 @@
+   Vector<gfx::QuadF> quads;
+   GetBorderAndTextQuads(quads);
+ 
+-  if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint) &&
++      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("clientrects") == std::string::npos)) {
+     for (gfx::QuadF& quad : quads) {
+-      quad.Scale(owner_document_->GetNoiseFactorX(), owner_document_->GetNoiseFactorY());
++      quad.Offset(owner_document_->GetNoiseFactorX(), owner_document_->GetNoiseFactorY());
+     }
+   }
+ 
+@@ -1678,8 +1683,11 @@
+   // impact is understood.
+   SyncScrollAttemptHeuristic::DidAccessScrollOffset();
+   auto rect = BoundingRect();
+-  if (RuntimeEnabledFeatures::FingerprintingClientRectsNoiseEnabled()) {
+-    rect.Scale(owner_document_->GetNoiseFactorX(), owner_document_->GetNoiseFactorY());
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kFingerprint) &&
++      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
++       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("clientrects") == std::string::npos)) {
++    rect.Offset(owner_document_->GetNoiseFactorX(), owner_document_->GetNoiseFactorY());
+   }
+   return DOMRect::FromRectF(rect);
+ }
+--- a/ui/gfx/geometry/quad_f.cc
++++ b/ui/gfx/geometry/quad_f.cc
+@@ -137,6 +137,22 @@
+   p4_.Scale(x_scale, y_scale);
+ }
+ 
++void QuadF::Offset(float x_offset, float y_offset) {
++  // 计算轴对齐边界框的宽高
++  const auto [min, max] = Extents();
++  float width = max.x() - min.x();
++  float height = max.y() - min.y();
++
++  if (WithinEpsilon(width, 0.0f) || WithinEpsilon(height, 0.0f)) {
++    return;
++  }
++
++  p1_.Offset(x_offset, y_offset);
++  p2_.Offset(x_offset, y_offset);
++  p3_.Offset(x_offset, y_offset);
++  p4_.Offset(x_offset, y_offset);
++}
++
+ void QuadF::operator+=(const Vector2dF& rhs) {
+   p1_ += rhs;
+   p2_ += rhs;
+--- a/ui/gfx/geometry/quad_f.h
++++ b/ui/gfx/geometry/quad_f.h
+@@ -106,6 +106,11 @@
+   // Scale each point in the quad by the scale factors along each axis.
+   void Scale(float x_scale, float y_scale);
+ 
++  // Offset each point in the quad by the offset values.
++  void Offset(float offset) { Offset(offset, offset); }
++  // Offset each point in the quad by the offset values along each axis.
++  void Offset(float x_offset, float y_offset);
++
+   // Tests whether any part of the rectangle intersects with this quad.
+   // This only works for convex quads.
+   // This intersection is edge-inclusive and will return true even if the
