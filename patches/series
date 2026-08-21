@@ -36,3 +36,4 @@ veil/014-client-rects.patch
 veil/002-user-agent-fingerprint.patch
 veil/011-gpu-info.patch
 veil/016-webgl-readPixels.patch
+veil/001-disable-runtime-enable.patch

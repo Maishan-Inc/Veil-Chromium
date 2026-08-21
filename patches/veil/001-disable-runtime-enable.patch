@@ -1,0 +1,128 @@
+# Origin:  adryfish/fingerprint-chromium
+# Source:  patches/extra/fingerprint/001-disable-runtime.enable.patch
+# Commit:  831623f2965e34554304caabfc3a1e4e3741db1f (tag 144.0.7559.132)
+# License: BSD-3-Clause (see CREDITS.md)
+# Changes: regenerated against v8 at the DEPS pin for Chromium 151.0.7922.137,
+#          v8_revision 00c2754b59cf5f79b323950c63b07cfb1a8377d4. The header hunk and the
+#          messageAdded hunk applied unchanged (the latter at +27); addBindings needed rebuilding,
+#          because 151's v8 added `int contextGroupId` / `int contextId` locals and a re-entrancy
+#          check -- if (!m_inspector->getContext(contextGroupId, contextId)) return; -- inside both
+#          loops.
+#
+#          Those two locals cannot stay live above the early return the way the 144 patch leaves
+#          `contextName` live: -Wunused-variable fires for an int and not for a String16, whose
+#          constructor and destructor are non-trivial. So they are commented out with the rest of
+#          the body and only contextName remains above `return;`, which is exactly the shape the
+#          144 patch has.
+#
+# This is the only Tier 1 patch that touches v8, a DEPS-managed separate repository.
+#
+# Suppresses the classic Runtime.enable CDP tell. With a debugger attached, serialising a console
+# message reads Error.prototype.stack, so a page can plant a getter on `stack`, call console.debug,
+# and learn that something is inspecting it. The patch stops V8RuntimeAgentImpl from reporting
+# console messages, stops it from installing Runtime bindings, and makes enabled() always return
+# false.
+#
+# Measured 2026-08-21 by attaching a CDP client, calling Runtime.enable and watching what the
+# inspector volunteers -- control binary vs this build:
+#
+#                              control   patched
+#   Runtime.evaluate works       true      true     (the baseline harness is unaffected)
+#   executionContextCreated       1         1       (enable() reports contexts directly)
+#   consoleAPICalled              1         0       <- the patch working
+#   in-page Error#stack tell      0         0
+#
+# So it does close the channel: with a debugger attached the inspector no longer forwards the page's
+# console output, and object serialisation is what the classic probe depends on. But that probe --
+# plant a getter on an Error's stack, console.log it, see whether the getter fires -- reads 0 on the
+# UNPATCHED 151 too, so this particular tell was already inert upstream. Recorded rather than
+# claimed: see Veil/docs/MIGRATION-UNGOOGLED.md 5.1p.
+#
+# Cost: consoleAPICalled going to 0 means an attached DevTools shows nothing the page logs. Veil
+# consumes no CDP console events today (nothing in the repo subscribes to consoleAPICalled), so
+# nothing here breaks, but any future automation that reads page logs would.
+#
+# The detection baseline cannot see this: the harness itself drives the browser over CDP, and it
+# never calls Runtime.enable (its client has a five-method allowlist). Verified out of band instead.
+#
+--- a/v8/src/inspector/v8-runtime-agent-impl.cc
++++ b/v8/src/inspector/v8-runtime-agent-impl.cc
+@@ -1071,32 +1071,33 @@
+ }
+ 
+ void V8RuntimeAgentImpl::addBindings(InspectedContext* context) {
+-  int contextGroupId = context->contextGroupId();
+-  int contextId = context->contextId();
+   const String16 contextName = context->humanReadableName();
+-  if (!m_enabled) return;
+-
+-  protocol::DictionaryValue* globalBindings =
+-      m_state->getObject(V8RuntimeAgentImplState::globalBindings);
+-  if (globalBindings) {
+-    for (size_t i = 0; i < globalBindings->size(); ++i) {
+-      addBinding(context, globalBindings->at(i).first);
+-      if (!m_inspector->getContext(contextGroupId, contextId)) return;
+-    }
+-  }
+-
+-  protocol::DictionaryValue* contextBindings =
+-      m_state->getObject(V8RuntimeAgentImplState::contextBindings);
+-  if (contextBindings) {
+-    protocol::DictionaryValue* bindings =
+-        contextBindings->getObject(contextName);
+-    if (bindings) {
+-      for (size_t i = 0; i < bindings->size(); ++i) {
+-        addBinding(context, bindings->at(i).first);
+-        if (!m_inspector->getContext(contextGroupId, contextId)) return;
+-      }
+-    }
+-  }
++  return;
++  // int contextGroupId = context->contextGroupId();
++  // int contextId = context->contextId();
++  // if (!m_enabled) return;
++  //
++  // protocol::DictionaryValue* globalBindings =
++  //     m_state->getObject(V8RuntimeAgentImplState::globalBindings);
++  // if (globalBindings) {
++  //   for (size_t i = 0; i < globalBindings->size(); ++i) {
++  //     addBinding(context, globalBindings->at(i).first);
++  //     if (!m_inspector->getContext(contextGroupId, contextId)) return;
++  //   }
++  // }
++  //
++  // protocol::DictionaryValue* contextBindings =
++  //     m_state->getObject(V8RuntimeAgentImplState::contextBindings);
++  // if (contextBindings) {
++  //   protocol::DictionaryValue* bindings =
++  //       contextBindings->getObject(contextName);
++  //   if (bindings) {
++  //     for (size_t i = 0; i < bindings->size(); ++i) {
++  //       addBinding(context, bindings->at(i).first);
++  //       if (!m_inspector->getContext(contextGroupId, contextId)) return;
++  //     }
++  //   }
++  // }
+ }
+ 
+ void V8RuntimeAgentImpl::restore() {
+@@ -1229,7 +1230,7 @@
+ }
+ 
+ void V8RuntimeAgentImpl::messageAdded(V8ConsoleMessage* message) {
+-  if (m_enabled) reportMessage(message, true);
++  // if (m_enabled) reportMessage(message, true);
+ }
+ 
+ bool V8RuntimeAgentImpl::reportMessage(V8ConsoleMessage* message,
+--- a/v8/src/inspector/v8-runtime-agent-impl.h
++++ b/v8/src/inspector/v8-runtime-agent-impl.h
+@@ -160,7 +160,7 @@
+                std::unique_ptr<protocol::DictionaryValue> hints,
+                int executionContextId);
+   void messageAdded(V8ConsoleMessage*);
+-  bool enabled() const { return m_enabled; }
++  bool enabled() const { return false; }
+ 
+  private:
+   bool reportMessage(V8ConsoleMessage*, bool generatePreview);
