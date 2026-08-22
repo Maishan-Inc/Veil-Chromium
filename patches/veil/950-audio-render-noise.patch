@@ -1,0 +1,130 @@
+# Origin:  none -- Veil-authored. No upstream counterpart, and not a correction to a ported patch
+#          either: it replaces veil/003-audio-fingerprint.patch, which is dropped from
+#          patches/series in the same change. Hence the 950-999 range rather than 903 -- see
+#          patches/veil/README.md -> "Veil-authored patches".
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# Perturbs the RENDERED SAMPLES of an OfflineAudioContext, deterministically from
+# --fingerprint=<seed>, instead of perturbing the reported sample rate. Gated off by
+# --disable-spoofing=audio, the same key 003 read.
+#
+# Why 003 is replaced rather than corrected. Measured, Veil/docs/MIGRATION-UNGOOGLED.md 5.1f and 5.1u:
+#
+# 1. It reported a sample rate the page did not ask for. 003 added noise in +/-0.01 Hz to the
+#    OfflineAudioContext's sample rate, so a page constructing OfflineAudioContext(1, N, 44100) got
+#    back 44100.0078125 (seed 7) or 44100.00390625 (seed 8). No real browser can do that -- the
+#    constructor's sampleRate argument IS what the context reports -- and Number.isInteger() on it is
+#    a one-expression detector needing no knowledge of the seed. The live AudioContext in the same
+#    page still reported exactly 44100, so the two contradicted each other. It fired for roughly four
+#    seeds in five, which is worse than the marker 007 was dropped for.
+#
+# 2. For the other seed in five it did nothing at all. The noise was added to a FLOAT sample rate,
+#    and a float's ULP at 44100 is 2^-8 = 0.00390625, so any |noise| below half an ULP --
+#    0.001953125, i.e. 19.5% of the +/-0.01 range -- rounded away and left the rate bit-identical to
+#    unpatched. What survived was quantised to multiples of 0.00390625, so the whole surface carried
+#    about five distinct values rather than one per seed.
+#
+# 3. So the two fixes 5.1f named were both wrong. Scaling the noise to at least one ULP fixes (2) by
+#    making (1) larger and more visible; perturbing the samples is the only place the noise can go.
+#
+# 4. Its getNoiseData() helper was dead. Defined, never called -- which is why buffer.length measured
+#    exactly 44100*3 = 132300 in every snapshot at every seed.
+#
+# The perturbation is relative (samples[i] *= 1 + noise, noise uniform in +/-1e-4) rather than
+# additive, so it has no dead zone: the relative ULP of a float is 2^-24 ~= 6e-8, so a sample fails
+# to move only for about 0.06% of draws, and a buffer of 132300 frames failing entirely has
+# probability ~0. -80 dB is inaudible and well inside the spread real DSP rounding produces. Silent
+# channels are skipped: a multiplicative factor leaves 0 at 0, and skipping also avoids clearing
+# AudioChannel's silent flag.
+#
+# It is keyed on the seed, the channel index and the ABSOLUTE frame index, so it does not depend on
+# render quantum boundaries or on a suspend/resume, and it is identical in every realm and every run.
+# The hook is the point in DoOfflineRendering() where a quantum has been rendered and is about to be
+# copied into the shared render target, so it runs exactly once over each frame and never on the
+# allocation-failure path.
+#
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+@@ -6,8 +6,10 @@
+ 
+ #include <algorithm>
+ 
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/trace_event/typed_macros.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "media/base/audio_bus.h"
+ #include "media/base/audio_glitch_info.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+@@ -28,6 +30,58 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// Seed-derived perturbation of the rendered offline buffer, applied to the frames of one render
++// quantum before they are copied out. Veil-authored; it replaces the sample-rate perturbation
++// 003-audio-fingerprint used, which was both quantised away for about a seed in five and illegal --
++// an OfflineAudioContext must report the sample rate the page asked for. See the patch header.
++//
++// Keyed on the seed, the channel and the ABSOLUTE frame index, so the result depends on neither the
++// render quantum boundaries nor a suspend/resume, and is identical in every realm and every run.
++void PerturbRenderedAudio(AudioBus* bus,
++                          size_t first_frame,
++                          uint32_t frame_count) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(switches::kFingerprint)) {
++    return;
++  }
++  if (command_line->HasSwitch(switches::kDisableSpoofing) &&
++      command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("audio") !=
++          std::string::npos) {
++    return;
++  }
++  const std::string seed_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
++  if (seed_str.empty()) {
++    return;
++  }
++  const uint32_t seed = static_cast<uint32_t>(std::hash<std::string>{}(seed_str + "audio"));
++
++  for (unsigned channel_index = 0; channel_index < bus->NumberOfChannels(); ++channel_index) {
++    AudioChannel* channel = bus->Channel(channel_index);
++    // Silence stays exactly silent: a multiplicative factor leaves 0 at 0, and skipping the
++    // channel also leaves AudioChannel's silent flag alone rather than clearing it.
++    if (!channel || channel->IsSilent()) {
++      continue;
++    }
++    base::span<float> samples = channel->MutableSpan();
++    const uint32_t limit = std::min(frame_count, static_cast<uint32_t>(samples.size()));
++    for (uint32_t i = 0; i < limit; ++i) {
++      uint32_t x = seed ^ (channel_index * 2654435761u) ^
++                   (static_cast<uint32_t>(first_frame + i) * 2246822519u);
++      x ^= x << 13;
++      x ^= x >> 17;
++      x ^= x << 5;
++      // Relative, so every non-zero sample moves by more than a float ULP: the relative ULP is
++      // 2^-24 ~= 6e-8 and the factor is uniform in +/-1e-4. -80 dB, inaudible.
++      const float noise = (static_cast<float>(x) / 4294967295.0f - 0.5f) * 2e-4f;
++      samples[i] *= (1.0f + noise);
++    }
++  }
++}
++
++}  // namespace
++
+ OfflineAudioDestinationHandler::OfflineAudioDestinationHandler(
+     AudioNode& node,
+     unsigned number_of_channels,
+@@ -196,6 +250,9 @@
+     uint32_t frames_available_to_copy = std::min(
+         frames_to_process_, GetDeferredTaskHandler().RenderQuantumFrames());
+ 
++    PerturbRenderedAudio(render_bus_.get(), frames_processed_,
++                         frames_available_to_copy);
++
+     for (unsigned channel_index = 0; channel_index < number_of_channels;
+          ++channel_index) {
+       shared_render_target_->channels()[channel_index]

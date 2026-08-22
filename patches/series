@@ -26,7 +26,7 @@ veil/005-hardware-concurrency-fingerprint.patch
 veil/009-webdriver.patch
 veil/010-headless.patch
 veil/018-timezone.patch
-veil/003-audio-fingerprint.patch
+veil/950-audio-render-noise.patch
 veil/012-canvas-get-image-data.patch
 veil/015-canvas-measure-text.patch
 veil/915-canvas-measure-text-multiplier-and-worker.patch

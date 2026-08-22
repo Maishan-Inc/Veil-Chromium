@@ -38,10 +38,16 @@ CI trim in this fork is documented in the header of
 
 [`adryfish/fingerprint-chromium`][fc] — BSD-3-Clause.
 
-Source of the Tier 1 patch set: switch registration and seed plumbing, UA/UA-CH coherence, audio,
-canvas (`getImageData`, `toDataURL`, `measureText`), `getClientRects`, WebGL `readPixels`, GPU info,
+Source of the Tier 1 patch set: switch registration and seed plumbing, UA/UA-CH coherence, canvas
+(`getImageData`, `toDataURL`, `measureText`), `getClientRects`, WebGL `readPixels`, GPU info,
 font enumeration, `hardwareConcurrency`, timezone-as-a-switch, and the `navigator.webdriver` /
 headless / `Runtime.enable` surfaces.
+
+Two of its patches are **not** shipped: `007-shadow-root`, which added an ungated
+`Element.fakeShadowRoot` marker rather than closing a surface, and `003-audio-fingerprint`, whose
+perturbation of the reported sample rate was both illegal (an `OfflineAudioContext` must report the
+rate the page asked for) and quantised away for about a seed in five. The audio surface is now Veil's
+own — see **Veil** below.
 
 ## clearcote-browser
 
@@ -72,9 +78,15 @@ because a ported patch is kept byte-identical to its source — that is what its
 rule (`9NN` corrects `0NN`, `950`–`999` for patches with no ported counterpart) is in
 `patches/veil/README.md`.
 
-Present in this range today: `915-canvas-measure-text-multiplier-and-worker`, which fixes two measured
-defects in `015` — a multiplicative `TextMetrics::Shuffle()` call site handed an additive noise value,
-and a realm test that left a Worker's `OffscreenCanvas` unspoofed.
+Present in this range today:
+
+- `915-canvas-measure-text-multiplier-and-worker` — fixes three measured defects in `015`: a
+  multiplicative `TextMetrics::Shuffle()` call site handed an additive noise value, a realm test that
+  left a Worker's `OffscreenCanvas` unspoofed, and an empty-string guard that made the perturbation
+  factor recoverable in one expression.
+- `950-audio-render-noise` — perturbs the rendered samples of an `OfflineAudioContext` from the seed.
+  Replaces `003-audio-fingerprint` outright rather than correcting it: that patch perturbed the
+  *reported sample rate*, which no real browser can do, so there was nothing to keep.
 
 ## Notes on licensing
 
