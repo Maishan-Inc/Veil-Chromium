@@ -1,8 +1,9 @@
 # Credits
 
 `Veil-Chromium` is a fork of [`ungoogled-software/ungoogled-chromium-windows`][ucw] carrying Veil's
-fingerprint patch set. Nothing here is original browser engineering; it is Chromium plus other
-people's de-Googling and anti-fingerprinting work, rebased and extended.
+fingerprint patch set. Almost nothing here is original browser engineering; it is Chromium plus other
+people's de-Googling and anti-fingerprinting work, rebased and extended. The exception is the small
+`9NN` range in `patches/veil/`, which is Veil's own — see **Veil** below.
 
 Per-patch provenance lives in each patch's own header comment (`Origin`, `Source`, `Commit`,
 `License`, `Changes`) — see `patches/veil/README.md`. This file is the project-level attribution.
@@ -60,6 +61,21 @@ No Brave code is ported. Brave's **per-site deterministic farbling** is the desi
 follows for keeping a persona stable per origin while remaining unique across origins. Credited as
 prior art for the approach, not as a code dependency.
 
+## Veil
+
+[`Maishan-Inc/Veil-Chromium`][self] — BSD-3-Clause, the same terms as the code these patches edit.
+
+The `9NN` patches in `patches/veil/` are Veil-authored and have no upstream counterpart. They exist
+because a ported patch is kept byte-identical to its source — that is what its `Origin` / `Source` /
+`Commit` header asserts — so a correction to one lives in its own file instead. Each declares
+`Origin: none -- Veil-authored` explicitly and cites the measurement that justifies it; the numbering
+rule (`9NN` corrects `0NN`, `950`–`999` for patches with no ported counterpart) is in
+`patches/veil/README.md`.
+
+Present in this range today: `915-canvas-measure-text-multiplier-and-worker`, which fixes two measured
+defects in `015` — a multiplicative `TextMetrics::Shuffle()` call site handed an additive noise value,
+and a realm test that left a Worker's `OffscreenCanvas` unspoofed.
+
 ## Notes on licensing
 
 - Chromium, ungoogled-chromium, ungoogled-chromium-windows, fingerprint-chromium and
@@ -74,6 +90,7 @@ prior art for the approach, not as a code dependency.
 [cc]: https://github.com/clearcotelabs/clearcote-browser
 [chromium]: https://chromium.googlesource.com/chromium/src/
 [fc]: https://github.com/adryfish/fingerprint-chromium
+[self]: https://github.com/Maishan-Inc/Veil-Chromium
 [uc]: https://github.com/ungoogled-software/ungoogled-chromium
 [ucw]: https://github.com/ungoogled-software/ungoogled-chromium-windows
 [veil]: https://github.com/Maishan-Inc/Veil
