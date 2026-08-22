@@ -1,0 +1,64 @@
+# Origin:  none -- Veil-authored. There is no upstream counterpart: this patch corrects
+#          veil/015-canvas-measure-text.patch, which is deliberately left byte-identical to
+#          the port so its BSD-3 attribution stays a statement about adryfish's code and
+#          nothing else. See patches/veil/README.md -> "Veil-authored patches" for the 9NN
+#          numbering rule and why a deviation lives in its own file.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# Fixes both measured defects in 015. Justification is measurement, not review:
+# Veil/docs/MIGRATION-UNGOOGLED.md 5.1h recorded them from the cross-realm side and 5.1q
+# (Assertion 3) from the seed side; 5.1r records this fix and its numbers.
+#
+# 1. Multiplicative call site, additive value. TextMetrics::Shuffle(factor) multiplies
+#    width_, both bounding boxes, both em heights and all three baselines by factor. 015
+#    passes noise_x, which is uniform in +/-5e-6, so every metric collapses by ~1e-6:
+#    measureText("Cwm fjordbank glyphs vext quiz -- 0123456789").width measured
+#    567.4482421875 -> 0.000346040074084674 at --fingerprint=7. Worse, norm_x is uniform in
+#    +/-0.5, so roughly half of all seeds give a NEGATIVE factor -- seed 8 measured
+#    -0.0006870410154895411, and a negative TextMetrics.width cannot occur in any real
+#    browser. Passing 1.0 + noise_x restores the shape of the value 015 replaced
+#    (Document::GetNoiseFactorX(), ~1 +/- 1.5e-6) and keeps the seed derivation untouched.
+#
+# 2. The Worker realm was not spoofed at all. 015's perturbation sits behind
+#    HostAsOffscreenCanvas() -> DynamicTo<LocalDOMWindow>(GetTopExecutionContext()), and a
+#    module Worker's OffscreenCanvas takes that branch with no LocalDOMWindow, so Shuffle
+#    was never reached there: main frame 0.000346, Worker 567.4482421875, eight divergent
+#    leaves and the only cross-realm assertion failure in the whole Tier 1 set. That lookup
+#    existed only because GetNoiseFactorX() is a Document member. noise_x is derived from
+#    the seed string alone, so the branch is vestigial and both realms take one path.
+#
+# Deliberately unchanged: the seed derivation, the --disable-spoofing=canvas gate, and 015's
+# text.length() > 0 guard. Two residual weaknesses of the same family are measured in 5.1r
+# and left for Tier 2 rather than fixed here, because each is a behaviour change beyond the
+# two defects above: an empty string keeps its true font metrics while a non-empty one is
+# perturbed, and a multiplicative factor takes integer-valued metrics off their integers.
+#
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -1177,14 +1177,15 @@
+     double norm_x = (hash_val_x & 0xFFFFFFFF) / 4294967295.0 - 0.5;
+     // 使用 0.00001 作为因子 (相当于原来的 1/100000.0)
+     double noise_x = norm_x * 0.00001;
+-    if (HostAsOffscreenCanvas()) {
+-      if (auto* window = DynamicTo<LocalDOMWindow>(GetTopExecutionContext())) {
+-        if (window->GetFrame() && window->GetFrame()->GetDocument() && text.length() > 0) {
+-          text_metrics->Shuffle(noise_x);
+-        }
+-      }
+-    } else if (canvas && text.length() > 0) {
+-      text_metrics->Shuffle(noise_x);
++    // Veil deviation from 015, measured: TextMetrics::Shuffle() MULTIPLIES width_, both
++    // bounding boxes, both em heights and all three baselines by its argument, so passing
++    // the raw +/-5e-6 noise collapses every metric -- and makes every one of them negative
++    // for about half of all seeds. 1 + noise is the shape of the GetNoiseFactorX() value
++    // this call site replaced. The realm test goes with it: it existed only because
++    // GetNoiseFactorX() is a Document member, and requiring a LocalDOMWindow left an
++    // OffscreenCanvas in a Worker unspoofed, which is a cross-realm tell.
++    if (text.length() > 0) {
++      text_metrics->Shuffle(1.0 + noise_x);
+     }
+   }
+   return text_metrics;
