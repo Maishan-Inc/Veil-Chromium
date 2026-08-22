@@ -32,7 +32,6 @@ veil/015-canvas-measure-text.patch
 veil/915-canvas-measure-text-multiplier-and-worker.patch
 veil/013-canvas-toDataURL.patch
 veil/006-font-fingerprint.patch
-veil/007-shadow-root.patch
 veil/014-client-rects.patch
 veil/002-user-agent-fingerprint.patch
 veil/011-gpu-info.patch
