@@ -1,0 +1,27 @@
+# Line endings are load-bearing in this repository, not a style preference.
+#
+# `build.py` applies `patches/` with GNU `patch` against a Chromium checkout whose sources are LF.
+# Git's default on Windows here is `core.autocrlf=true`, so without this file a fresh clone would
+# materialise every `.patch` with CRLF line endings and hand `patch` hunks whose every line carries a
+# trailing CR. The local build tree happens to hold LF copies because the files were written that way,
+# so the hazard is invisible until CI checks the repository out -- and no CI build has ever applied a
+# `patches/veil/` patch (Stage 4 published a zero-patch release). Pin it rather than discover it.
+#
+# `patches/series` is extensionless and is read line by line, so it is pinned by name.
+* text=auto eol=lf
+*.patch text eol=lf
+patches/series text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.7z binary
+*.gz binary
+*.tar binary
+*.xz binary
+*.exe binary
+*.dll binary
+*.pdb binary
