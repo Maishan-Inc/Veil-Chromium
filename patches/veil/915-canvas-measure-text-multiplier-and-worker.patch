@@ -6,11 +6,11 @@
 # Source:  n/a -- authored in this repository.
 # Commit:  n/a -- see this repository's git log for this file.
 # License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
-# Changes: n/a -- not a port.
+# Changes: n/a -- not a port. Revised once, to add defect 3 below.
 #
-# Fixes both measured defects in 015. Justification is measurement, not review:
-# Veil/docs/MIGRATION-UNGOOGLED.md 5.1h recorded them from the cross-realm side and 5.1q
-# (Assertion 3) from the seed side; 5.1r records this fix and its numbers.
+# Fixes three measured defects in 015. Justification is measurement, not review:
+# Veil/docs/MIGRATION-UNGOOGLED.md 5.1h recorded the first two from the cross-realm side and 5.1q
+# (Assertion 3) from the seed side; 5.1r records the fix and its numbers, and 5.1t the third defect.
 #
 # 1. Multiplicative call site, additive value. TextMetrics::Shuffle(factor) multiplies
 #    width_, both bounding boxes, both em heights and all three baselines by factor. 015
@@ -30,15 +30,25 @@
 #    existed only because GetNoiseFactorX() is a Document member. noise_x is derived from
 #    the seed string alone, so the branch is vestigial and both realms take one path.
 #
-# Deliberately unchanged: the seed derivation, the --disable-spoofing=canvas gate, and 015's
-# text.length() > 0 guard. Two residual weaknesses of the same family are measured in 5.1r
-# and left for Tier 2 rather than fixed here, because each is a behaviour change beyond the
-# two defects above: an empty string keeps its true font metrics while a non-empty one is
-# perturbed, and a multiplicative factor takes integer-valued metrics off their integers.
+# 3. The empty string handed out the factor. 015 guards the perturbation with
+#    text.length() > 0, so measureText("") reported true font metrics while measureText("x")
+#    reported perturbed ones. Font metrics do not depend on the string in any real browser --
+#    measured on the control, fontBoundingBoxAscent is 29 for both -- so dividing one by the
+#    other yields the seed-derived factor exactly: 1.0000006098178624 at --fingerprint=7,
+#    against 1.0 unpatched. One expression, one page, no knowledge of the seed. The guard is
+#    dropped; an empty string's width_ is 0 and stays 0 under multiplication, so the only
+#    thing that changes is that its font metrics are perturbed too, which is what makes the
+#    surface self-consistent.
+#
+# Deliberately unchanged: the seed derivation and the --disable-spoofing=canvas gate. One residual
+# weakness is measured in 5.1t and left for Tier 2 with the arithmetic that shows why it cannot be
+# fixed at this noise magnitude -- a multiplicative factor takes integer-valued metrics off their
+# integers, and quantising the result back to the 1/4096 grid stock uses would erase the
+# perturbation entirely on every metric except width.
 #
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -1177,14 +1177,15 @@
+@@ -1177,15 +1177,21 @@
      double norm_x = (hash_val_x & 0xFFFFFFFF) / 4294967295.0 - 0.5;
      // 使用 0.00001 作为因子 (相当于原来的 1/100000.0)
      double noise_x = norm_x * 0.00001;
@@ -50,6 +60,7 @@
 -      }
 -    } else if (canvas && text.length() > 0) {
 -      text_metrics->Shuffle(noise_x);
+-    }
 +    // Veil deviation from 015, measured: TextMetrics::Shuffle() MULTIPLIES width_, both
 +    // bounding boxes, both em heights and all three baselines by its argument, so passing
 +    // the raw +/-5e-6 noise collapses every metric -- and makes every one of them negative
@@ -57,8 +68,14 @@
 +    // this call site replaced. The realm test goes with it: it existed only because
 +    // GetNoiseFactorX() is a Document member, and requiring a LocalDOMWindow left an
 +    // OffscreenCanvas in a Worker unspoofed, which is a cross-realm tell.
-+    if (text.length() > 0) {
-+      text_metrics->Shuffle(1.0 + noise_x);
-     }
++    //
++    // 015's text.length() > 0 guard goes with them, and for the same kind of reason. Font
++    // metrics do not depend on the string, so measureText("") and measureText("x") must
++    // agree on fontBoundingBoxAscent in any real browser; leaving the empty string
++    // unperturbed made the ratio between the two the exact seed-derived factor, readable
++    // from one page with no knowledge of the seed. An empty string's width_ is 0 and stays
++    // 0 under multiplication, so perturbing it costs nothing and closes that.
++    text_metrics->Shuffle(1.0 + noise_x);
    }
    return text_metrics;
+ }
