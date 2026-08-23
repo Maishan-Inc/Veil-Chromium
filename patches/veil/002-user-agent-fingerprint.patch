@@ -64,6 +64,15 @@
 # the version from the running build instead of a table, or to drive the UA string from the same
 # table -- a Veil-authored deviation, so Tier 2. See Veil/docs/MIGRATION-UNGOOGLED.md 5.1m.
 #
+# FIXED by veil/902-chromium-version-from-the-build.patch: the Chromium version now comes from
+# PRODUCT_VERSION, i.e. from the build itself, so UA and UA-CH agree by construction. That patch is
+# placed at the END of patches/series rather than immediately after this one, which is where
+# patches/veil/README.md says a corrective patch belongs -- the reason is that 011-gpu-info extends
+# the same fingerprint_data.h and comes after this patch, so keeping 902 last leaves 011 re-anchored
+# against 002's output exactly as it was measured, and only 902 has to move on a future rebase. See
+# 5.1v. The Edge/Opera/Vivaldi tables are deliberately left frozen there; they track other vendors'
+# release trains and Veil emits no --fingerprint-brand.
+#
 # It also removes the "Headless" product prefix from user_agent_utils.cc, which is the line 5.1e
 # measured as the real source of HeadlessChrome/... in chrome.exe --headless=new. 010 renames the
 # same string in the headless shell binary and does not affect chrome.exe.

@@ -1,0 +1,109 @@
+# Origin:  none -- Veil-authored. There is no upstream counterpart: this patch corrects
+#          veil/002-user-agent-fingerprint.patch, which is left byte-identical to the port so its
+#          BSD-3 attribution stays a statement about adryfish's code. See
+#          patches/veil/README.md -> "Veil-authored patches".
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# Derives the Chromium version UA-CH reports from the running build instead of a frozen table.
+# Measured in Veil/docs/MIGRATION-UNGOOGLED.md 5.1m and 5.1q; this fix and its numbers are 5.1v.
+#
+# 002 hard-codes components/ungoogled/fingerprint_data.h's version tables at the Chromium
+# fingerprint-chromium was built from: a four-entry 144-series list picked by seed
+# (144.0.7559.{132,109,96,59}). On this 151 base the engine therefore reported TWO VERSIONS AT ONCE --
+# Chrome/151.0.0.0 in navigator.userAgent and Chromium 144 / 144.0.7559.x in UA-CH -- unconditionally,
+# in every profile, with no user configuration involved. Any site that cross-checks the two finds it,
+# and it gets staler with every Chromium major.
+#
+# The fix is the first of the two 5.1m named: derive the version from the running build, so the two
+# agree by construction. PRODUCT_VERSION comes from gen/base/version_info/version_info_values.h,
+# generated from //chrome/VERSION, so it is the build's own version by definition and needs no
+# maintenance at an engine bump. The second option -- drive the UA string from the table instead, so
+# both say 144 -- is worse: the browser's actual behaviour, feature set and chrome.dll are 151, and
+# feature detection would contradict the claim immediately.
+#
+# kChromiumVersions stays an ARRAY so the seed-selection call site in
+# blink/common/user_agent/user_agent_metadata.cc needs no change. It has one entry: the seed must not
+# be able to pick a version that contradicts the build, which is the whole point. The cost is the 2
+# bits of seed entropy UA-CH's full version used to carry -- which 5.1q already called the weakest
+# entropy in the set, since all four values were the same frozen major.
+#
+# A second, quieter improvement falls out of it. GenerateFingerprintMetadata() parses its brand-list
+# seed out of the Chromium MAJOR (`base::StringToInt(chromium_major, &seed)`), which is upstream
+# Chromium's own scheme -- the GREASE brand order is stable per milestone. With the table frozen that
+# seed was 144 on a 151 build, so the brand list was ordered like a Chromium 144. It is now 151, i.e.
+# ordered the way a real Chromium 151 orders it.
+#
+# NOT changed, deliberately: kEdgeDefaultVersion, kEdgeUAVersion and the Opera and Vivaldi versions.
+# Those vendors have their own release trains and their own build numbers, which cannot be derived
+# from Chromium's -- picking one would be inventing a version string that may never have shipped. They
+# are also unreachable in Veil: to_engine_args emits no --fingerprint-brand, because 5.3 measured that
+# no Veil field maps to it. Recorded in 5.1v as a Tier 2 item gated on Veil gaining a brand field.
+#
+# Build cost, worth stating because 5.1m's figure misleads: 002 took 8163 targets because it also
+# touched third_party/blink/public/common/user_agent/user_agent_metadata.h, a public header. This
+# patch touches only fingerprint_data.h and the component's BUILD.gn, and ninja -n reports 389
+# targets -- the cheap single-.cc shape.
+#
+--- a/components/ungoogled/fingerprint_data.h
++++ b/components/ungoogled/fingerprint_data.h
+@@ -7,6 +7,11 @@
+ #ifndef COMPONENTS_UNGOOGLED_FINGERPRINT_DATA_H_
+ #define COMPONENTS_UNGOOGLED_FINGERPRINT_DATA_H_
+ 
++// PRODUCT_VERSION, generated from //chrome/VERSION into
++// gen/base/version_info/version_info_values.h. The Chromium version below is derived from it so
++// that UA-CH cannot disagree with the browser it is running in -- see the patch header.
++#include "base/version_info/version_info_values.h"
++
+ namespace ungoogled {
+ namespace fingerprint {
+ 
+@@ -23,16 +28,24 @@
+ // Browser Default Versions
+ // =============================================================================
+ 
+-// Chromium version list (for seed-based selection)
++// Chromium version, taken from the running build rather than from a table.
++//
++// This was a four-entry 144-series list selected by seed, frozen at the Chromium
++// fingerprint-chromium was built from. On any other base the engine reported two versions at once:
++// Chrome/<real major>.0.0.0 in navigator.userAgent and Chromium 144 in UA-CH, unconditionally and in
++// every profile. Deriving it means the two agree by construction and cannot go stale.
++//
++// It is an array of one so the seed-selection call site needs no change; the seed cannot pick a
++// version that contradicts the build, which is the whole point.
+ constexpr const char* kChromiumVersions[] = {
+-    "144.0.7559.132",
+-    "144.0.7559.109",
+-    "144.0.7559.96",
+-    "144.0.7559.59"
++    PRODUCT_VERSION
+ };
+ 
+ // Default versions for Client Hints (Sec-CH-UA)
+-constexpr const char* kChromeDefaultVersion = "144.0.7559.132";
++constexpr const char* kChromeDefaultVersion = PRODUCT_VERSION;
++// Edge, Opera and Vivaldi keep their own release trains and their own build numbers, which cannot be
++// derived from Chromium's. They stay frozen, and they are unreachable in Veil: to_engine_args emits
++// no --fingerprint-brand (Veil/docs/MIGRATION-UNGOOGLED.md 5.3). See 5.1v.
+ constexpr const char* kEdgeDefaultVersion = "144.0.3719.141";
+ constexpr const char* kOperaDefaultVersion = "129.0.5818.0";
+ constexpr const char* kVivaldiDefaultVersion = "7.8.3952.73";
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -11,5 +11,11 @@
+ 
+   defines = [ "IS_UNGOOGLED_IMPL" ]
+ 
+-  deps = [ "//base" ]
++  # generate_version_info produces gen/base/version_info/version_info_values.h, which
++  # fingerprint_data.h reads PRODUCT_VERSION from. The action rather than the static_library:
++  # this target needs the header, not the version_info functions.
++  deps = [
++    "//base",
++    "//base/version_info:generate_version_info",
++  ]
+ }

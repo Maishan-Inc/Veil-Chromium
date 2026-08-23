@@ -98,6 +98,12 @@ between the two is broken by construction — that is fine, and it is not the 5.
 ever built or measured from a partially applied series, and the pair is one atomic unit for the
 build. If you split a corrective patch away from its target, say why in both headers.
 
+One exception has been needed so far, and it shows what the "say why" is for:
+`902-chromium-version-from-the-build` sits at the **end** of the series rather than after `002`,
+because `011-gpu-info` extends the same `fingerprint_data.h` and applies after `002`. Keeping `902`
+last leaves `011` re-anchored against exactly the tree it was measured against, and puts the whole
+cost of a future rebase on the Veil-authored patch instead of on a ported one.
+
 ## Naming
 
 Mirror the numeric prefixes in `Veil/docs/ENGINE.md` → Tier 1 so the mapping between the plan and

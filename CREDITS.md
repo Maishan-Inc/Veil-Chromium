@@ -87,6 +87,9 @@ Present in this range today:
 - `950-audio-render-noise` — perturbs the rendered samples of an `OfflineAudioContext` from the seed.
   Replaces `003-audio-fingerprint` outright rather than correcting it: that patch perturbed the
   *reported sample rate*, which no real browser can do, so there was nothing to keep.
+- `902-chromium-version-from-the-build` — derives the Chromium version UA-CH reports from
+  `PRODUCT_VERSION` instead of `002`'s table, which was frozen at the Chromium
+  `fingerprint-chromium` was built from and made the engine claim two versions at once.
 
 ## Notes on licensing
 
