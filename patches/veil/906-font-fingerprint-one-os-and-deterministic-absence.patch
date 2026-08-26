@@ -1,0 +1,338 @@
+# Origin:  none -- Veil-authored. There is no upstream counterpart: this patch corrects
+#          veil/006-font-fingerprint.patch, which is deliberately left byte-identical to the port
+#          so its BSD-3 attribution stays a statement about adryfish's code and nothing else. See
+#          patches/veil/README.md -> "Veil-authored patches" for the 9NN numbering rule and why a
+#          deviation lives in its own file.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port. clearcotelabs/clearcote-browser's 040-fonts was audited as the
+#          counterpart and is NOT the source of this patch: its MetricCompatibleSubstitute() opens
+#          with `if (host_os != "linux") return std::string();` so it never executes on a Windows
+#          host, and its deterministic-absence rule reads ungoogled::CurrentPersona().fonts, a
+#          second identity source Veil rejected in 5.5b. One idea is shared, and credited as an
+#          argument rather than as code: absence must follow a reason, not a probability.
+#
+# Justification is measurement, not review. Veil/docs/MIGRATION-UNGOOGLED.md 6.3 scored assertion 6
+# over the committed corpus and found exactly one `defect` on the shipping engine: the font list of
+# `151.0.7922.137-1.1001` / persona, which claims macOS and enumerates
+#
+#   macos:   Apple Color Emoji, Baskerville, Geneva, Hiragino Sans, Menlo, Monaco, Optima, PingFang SC
+#   windows: Segoe UI, Microsoft Sans Serif, Microsoft PhagsPa
+#
+# at the same time. No machine runs two operating systems. 6.8 records what this patch measured.
+#
+# FOUR mechanisms produced that snapshot, and they are independent. Note that 006 substitutes -- it
+# does not merely hide -- so the plan's "hiding alone cannot be right on a Windows host" framing was
+# wrong about the cause:
+#
+# 1. IsBasicFont returned before the platform branch, and its list held concrete faces --
+#    "Segoe UI", "Microsoft Sans Serif", "Calibri", "Helvetica Neue", "Lucida Grande" -- so those
+#    were present under EVERY persona, independent of the seed and of --fingerprint-platform. Two of
+#    the three leaked Windows families came from there, and the same list would have leaked
+#    "Helvetica Neue" and "Lucida Grande" onto a WINDOWS persona from a host that had them, which is
+#    the same contradiction pointing the other way. Split rather than deleted: a CSS generic keyword,
+#    `system-ui`, `-webkit-standard`, `BlinkMacSystemFont` and the X11-era `Sans` are not families a
+#    page can find absent, they are the fallback path the rest of this block depends on. They stay
+#    exempt (IsGenericFontFamily). Every concrete face now answers to the claimed platform's table.
+#
+# 2. Absence was probabilistic -- 0.95 for a non-platform family cross-OS, 0.02 per family same-OS.
+#    "Microsoft PhagsPa" is the 5%, which is not a rare event when a page asks about 85 families.
+#    Replaced cross-OS by membership: the claimed platform presents a family if its canonical table
+#    lists it, and does not if it does not, for every seed. Same-OS, the probability is deleted and
+#    not replaced -- see "deliberately not done" below, where the measurement says why.
+#
+# 3. The macOS table was polluted with Windows faces. Ten of them, where 6.5 named one. Only TWO are
+#    deleted, and the reason for each side is the point:
+#      deleted -- "Microsoft Sans Serif": a Windows system UI face with no Apple or Office-for-Mac
+#                 distribution channel, and the one name coherence.mjs's OS_ONLY_FONTS.windows uses
+#                 to carry a platform claim. If Apple does ship it, the correction belongs in
+#                 OS_ONLY_FONTS rather than here, and the cost of this line is one family a Mac
+#                 might have and this persona says it does not -- the mild direction of error.
+#      deleted -- "Carlito": a metric-compatible Calibri clone distributed with LibreOffice and by
+#                 Linux distributions. Neither Apple nor Microsoft ships it to a Mac; it is a
+#                 Linux-ism that reached the macOS branch by copying.
+#      kept    -- "Georgia", "Verdana", "Trebuchet MS", "Comic Sans MS", "Impact", "Tahoma",
+#                 "Webdings", "Wingdings": Microsoft's cross-platform web and Office faces, which
+#                 arrive on a Mac with Office. Deleting them would build the opposite
+#                 implausibility -- a Mac with Office but no Georgia -- and not one of the eight is
+#                 in OS_ONLY_FONTS, precisely because Office is a second distribution channel.
+#    The set the table now describes is a Mac carrying Microsoft's core web fonts and the classic
+#    Office faces (Garamond, Rockwell, Bookman Old Style, Book Antiqua, Century Gothic) but not the
+#    ClearType six (Calibri, Cambria, Candara, Consolas, Constantia, Corbel). That is one real
+#    machine among several rather than a contradiction, so the six are deliberately NOT added:
+#    deleting a false name is a fix, adding a name is a new claim. Recorded in 6.8 as revisitable.
+#
+# 4. The substitute was not required to resolve. 006 took current_os_fonts[hash % size]
+#    unconditionally, and when that Windows face was not installed on the host the family came back
+#    ABSENT -- which is why "Avenir" and "Didot" are missing from the -1.1001 persona while "Menlo"
+#    is present. The present set was therefore a function of which random substitute happened to
+#    exist: a per-family lottery in a different costume. The substitute now walks the host table
+#    from the same (seed, family)-derived offset until one resolves.
+#
+# THREE things deliberately not done, and the second is a measurement rather than a preference:
+#
+# - No substitution in the same-OS branch. A family in the table but absent from the host is
+#   reported absent, which is what a machine without that font reports. Substituting would trade a
+#   truthful absence for a present family carrying another face's advance widths -- and it would put
+#   a monospace request on a proportional face.
+#
+# - **No masking of the host's own set in the same-OS branch.** The first draft of this patch applied
+#   the membership rule to both branches, and it was built and measured before being rejected (6.8).
+#   A strict "present only if the canonical table lists it" rule also hides the family Settings names
+#   for `serif`, `sans-serif` and `monospace`: on this zh-CN host those are localised names that no
+#   English table contains, so all three generics fell through to the last-resort face and the probe
+#   measured 1040x80 for every one of them, against 792x72 / 1124x105 / 1210x104 before. A machine
+#   whose serif, sans-serif and monospace are the same face is a louder tell than the host's spare
+#   Office fonts, and "Arial" then reads *absent* because the generic it is compared against became
+#   Arial. Fixing it needs the Settings font families, which live in FontSelector and not in
+#   FontCache -- the same dependency `972` needs in order to make generic resolution follow the
+#   claimed platform, so the same-OS half of this surface lands there (T12). What this patch does
+#   keep in the same-OS branch is the one contradiction it can score, and it is exactly the rule
+#   assertion 6's font-set-belongs-to-one-os states: a family the claimed platform's table does NOT
+#   list while another platform's does is hidden. A Windows machine that some application gave
+#   "Menlo" or "Lucida Grande" therefore does not enumerate two operating systems. Both clauses
+#   matter -- dropping the first one hides the thirteen families the Windows and macOS tables share
+#   (Arial, Georgia, Verdana, Tahoma, ...), measured at 44/85 against 57 before it was added back.
+#   The measured cost of the rule as written is one family: "Arial Narrow" is on this host and in
+#   the macOS table but missing from 006's Windows table, so a Windows persona reports it absent.
+#   That is a machine without Office, which exists; the fix is a completer Windows table, not a
+#   looser rule.
+#
+# - The advance widths of a cross-OS persona are still the host's, and this patch cannot fix that.
+#   Reporting Menlo with Menlo's metrics needs Menlo's outlines; Windows ships no metric-compatible
+#   clone of it, and Veil bundles no font files. That residual is measured in 6.8 and registered in
+#   coherence.mjs's notScorableHere as a two-snapshot check, because a single snapshot cannot tell
+#   "Menlo measures like Menlo" from "Menlo measures like Tahoma" without a font-metric spec sheet.
+#
+# No switch is added. The behaviour is driven entirely by --fingerprint and --fingerprint-platform,
+# which 000 already declares and 006 already reads, so the flag dialect does not grow and none of the
+# three mirrors moves. `--disable-spoofing=font` still opts the whole block out.
+#
+# Compiles with the two warning classes 006 already produces, neither introduced here and neither
+# fatal in this configuration: -Wexit-time-destructors on the function-local statics, and
+# -Wshorten-64-to-32 on 006's own `uint32_t hash = std::hash<std::string>{}(...)` line.
+#
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -182,7 +182,7 @@
+     return {
+       "Academy Engraved LET", "Adelle Sans Devanagari", "AkayaKanadaka", "AkayaTelivigala", "Al Bayan", "Al Firat", "Al Khalil", "Al Nile", "Al Rafidain", "Al Rafidain Al Fanni", "Al Tarikh", "Algiers", "American Typewriter", "Andale Mono", "Annai MN", "Apple Braille", "Apple Chancery", "Apple Color Emoji", "Apple LiGothic", "Apple LiSung", "Apple SD Gothic Neo", "Apple Symbols", "AppleGothic", "AppleMyungjo", "Arial", "Arial Hebrew", "Arial Narrow", "Arial Rounded MT", "Arial Unicode MS", "Arima Koshi", "Arima Madurai", "Asphalt", "Athelas", "Avenir", "Avenir Next", "Ayuthaya",
+       "Baghdad", "Bai Jamjuree", "Balega", "Baloo 2", "Baloo Bhai 2", "Baloo Bhaijaan", "Baloo Bhaina 2", "Baloo Chettan 2", "Baloo Da 2", "Baloo Paaji 2", "Baloo Tamma 2", "Baloo Tammudu 2", "Baloo Thambi 2", "Bangla MN", "Bangla Sangam MN", "Bank Gothic", "Baoli SC", "Baoli TC", "Baskerville", "Basra", "Bebas Neue", "Beirut", "BiauKaiHK", "BiauKaiTC", "Big Caslon", "BIZ UDGothic", "BIZ UDMincho", "Blackmoor LET", "BlairMdITC TT", "BM DoHyeon OTF", "BM HANNA 11yrs old OTF", "BM HANNA Air OTF", "BM HANNA Pro OTF", "BM JUA OTF", "BM KIRANGHAERANG OTF", "BM YEONSUNG OTF", "Bodoni 72", "Bodoni 72 Oldstyle", "Bodoni 72 Smallcaps", "Bodoni Ornaments", "Book Antiqua", "Bookman Old Style", "Bordeaux Roman Bold LET", "Bradley Hand", "Braganza", "Brill Italic", "Brill Roman", "Brush Script MT",
+-      "Cambay Devanagari", "Canela", "Canela Deck", "Canela Text", "Capitals", "Carlito", "Catamaran", "Century Gothic", "Century Schoolbook", "Chakra Petch", "Chalkboard", "Chalkboard SE", "Chalkduster", "Charcoal CY", "Charm", "Charmonman", "Charter", "Cochin", "Comic Sans MS", "Copperplate", "Corsiva Hebrew", "Courier", "Courier New",
++      "Cambay Devanagari", "Canela", "Canela Deck", "Canela Text", "Capitals", "Catamaran", "Century Gothic", "Century Schoolbook", "Chakra Petch", "Chalkboard", "Chalkboard SE", "Chalkduster", "Charcoal CY", "Charm", "Charmonman", "Charter", "Cochin", "Comic Sans MS", "Copperplate", "Corsiva Hebrew", "Courier", "Courier New",
+       "Damascus", "Dash", "Dear Joe Four", "DecoType Naskh", "Devanagari MT", "Devanagari Sangam MN", "DFKaiShu-SB-Estd-BF", "Didot", "Dijla", "DIN Alternate", "DIN Condensed", "Diwan Kufi", "Diwan Thuluth", "Domaine Display", "Druk", "Druk Text", "Druk Wide",
+       "Euphemia UCAS",
+       "Fahkwang", "Fakt Slab Stencil Pro", "Farah", "Farisi", "Forgotten Futurist", "Founders Grotesk", "Founders Grotesk Text", "Futura",
+@@ -192,7 +192,7 @@
+       "Jaini", "Jaini Purva", "Jazz LET", "Journal Sans New",
+       "K2D", "Kai", "Kailasa", "Kaiti SC", "Kaiti TC", "Kannada MN", "Kannada Sangam MN", "Katari", "Kavivanar", "Kefa", "Khmer MN", "Khmer Sangam MN", "Kigelia", "Kigelia Arabic", "Klee", "Kodchasan", "Kohinoor Bangla", "Kohinoor Devanagari", "Kohinoor Gujarati", "Kohinoor Telugu", "KoHo", "Kokonor", "Koufi Abjadi", "Krub", "Krungthep", "KufiStandardGK",
+       "Lahore Gurmukhi", "Laimoon", "Lantinghei SC", "Lantinghei TC", "Lao MN", "Lao Sangam MN", "Lava Devanagari", "Lava Kannada", "Lava Telugu", "Libian SC", "Libian TC", "LiHei Pro", "LingWai SC", "LingWai TC", "LiSong Pro", "Lucida Grande", "Luminari",
+-      "Maku", "Malayalam MN", "Malayalam Sangam MN", "Mali", "Marion", "Marker Felt", "Menlo", "Microsoft Sans Serif", "Mishafi", "Mishafi Gold", "Modak", "Mona Lisa Solid ITC TT", "Monaco", "Mshtakan", "Mukta", "Mukta Malar", "Mukta Vaani", "MuktaMahee", "Muna", "Myanmar MN", "Myanmar Sangam MN", "Myriad Arabic",
++      "Maku", "Malayalam MN", "Malayalam Sangam MN", "Mali", "Marion", "Marker Felt", "Menlo", "Mishafi", "Mishafi Gold", "Modak", "Mona Lisa Solid ITC TT", "Monaco", "Mshtakan", "Mukta", "Mukta Malar", "Mukta Vaani", "MuktaMahee", "Muna", "Myanmar MN", "Myanmar Sangam MN", "Myriad Arabic",
+       "Nadeem", "Nanum Brush Script", "Nanum Pen Script", "NanumGothic", "NanumMyeongjo", "New Peninim MT", "Niramit", "Nisan", "Nom Na Tong", "Noteworthy", "Noto Nastaliq Urdu", "Noto Sans Adlam", "Noto Sans Armenian", "Noto Sans Avestan", "Noto Sans Bamum", "Noto Sans Bassa Vah", "Noto Sans Batak", "Noto Sans Bhaiksuki", "Noto Sans Brahmi", "Noto Sans Buginese", "Noto Sans Buhid", "Noto Sans Canadian Aboriginal", "Noto Sans Carian", "Noto Sans Caucasian Albanian", "Noto Sans Chakma", "Noto Sans Cham", "Noto Sans Coptic", "Noto Sans Cuneiform", "Noto Sans Cypriot", "Noto Sans Duployan", "Noto Sans Egyptian Hieroglyphs", "Noto Sans Elbasan", "Noto Sans Glagolitic", "Noto Sans Gothic", "Noto Sans Gunjala Gondi", "Noto Sans Hanifi Rohingya", "Noto Sans Hanunoo", "Noto Sans Hatran", "Noto Sans Imperial Aramaic", "Noto Sans Inscriptional Pahlavi", "Noto Sans Inscriptional Parthian", "Noto Sans Javanese", "Noto Sans Kaithi", "Noto Sans Kannada", "Noto Sans Kayah Li", "Noto Sans Kharoshthi", "Noto Sans Khojki", "Noto Sans Khudawadi", "Noto Sans Lepcha", "Noto Sans Limbu", "Noto Sans Linear A", "Noto Sans Linear B", "Noto Sans Lisu", "Noto Sans Lycian", "Noto Sans Lydian", "Noto Sans Mahajani", "Noto Sans Mandaic", "Noto Sans Manichaean", "Noto Sans Marchen", "Noto Sans Masaram Gondi", "Noto Sans Meetei Mayek", "Noto Sans Mende Kikakui", "Noto Sans Meroitic", "Noto Sans Miao", "Noto Sans Modi", "Noto Sans Mongolian", "Noto Sans Mro", "Noto Sans Multani", "Noto Sans Myanmar", "Noto Sans Nabataean", "Noto Sans New Tai Lue", "Noto Sans Newa", "Noto Sans NKo", "Noto Sans Ol Chiki", "Noto Sans Old Hungarian", "Noto Sans Old Italic", "Noto Sans Old North Arabian", "Noto Sans Old Permic", "Noto Sans Old Persian", "Noto Sans Old South Arabian", "Noto Sans Old Turkic", "Noto Sans Oriya", "Noto Sans Osage", "Noto Sans Osmanya", "Noto Sans Pahawh Hmong", "Noto Sans Palmyrene", "Noto Sans Pau Cin Hau", "Noto Sans PhagsPa", "Noto Sans Phoenician", "Noto Sans Psalter Pahlavi", "Noto Sans Rejang", "Noto Sans Samaritan", "Noto Sans Saurashtra", "Noto Sans Sharada", "Noto Sans Siddham", "Noto Sans Sora Sompeng", "Noto Sans Sundanese", "Noto Sans Syloti Nagri", "Noto Sans Syriac", "Noto Sans Tagalog", "Noto Sans Tagbanwa", "Noto Sans Tai Le", "Noto Sans Tai Tham", "Noto Sans Tai Viet", "Noto Sans Takri", "Noto Sans Thaana", "Noto Sans Tifinagh", "Noto Sans Tirhuta", "Noto Sans Ugaritic", "Noto Sans Vai", "Noto Sans Wancho", "Noto Sans Warang Citi", "Noto Sans Yi", "Noto Sans Zawgyi", "Noto Serif Ahom", "Noto Serif Balinese", "Noto Serif Hmong Nyiakeng", "Noto Serif Kannada", "Noto Serif Myanmar", "Noto Serif Yezidi", "November Bangla Traditional",
+       "October Compressed Devanagari", "October Compressed Gujarati", "October Compressed Gurmukhi", "October Compressed Kannada", "October Compressed Meetei Mayek", "October Compressed Odia", "October Compressed Ol Chiki", "October Compressed Tamil", "October Compressed Telugu", "October Condensed Devanagari", "October Condensed Gujarati", "October Condensed Gurmukhi", "October Condensed Kannada", "October Condensed Meetei Mayek", "October Condensed Odia", "October Condensed Ol Chiki", "October Condensed Tamil", "October Condensed Telugu", "October Devanagari", "October Gujarati", "October Gurmukhi", "October Kannada", "October Meetei Mayek", "October Odia", "October Ol Chiki", "October Tamil", "October Telugu", "Optima", "Oriya MN", "Oriya Sangam MN", "Osaka", "Osaka-Mono",
+       "Padyakke Expanded One", "Palatino", "Papyrus", "Party LET", "PCMyungjo", "Phosphate", "PilGi", "PingFang HK", "PingFang MO", "PingFang SC", "PingFang TC", "Plantagenet Cherokee", "PortagoITC TT", "Princetown LET", "Produkt", "Proxima Nova", "PSL Ornanong Pro", "PT Mono", "PT Sans", "PT Sans Caption", "PT Sans Narrow", "PT Serif", "PT Serif Caption", "Publico Headline", "Publico Text",
+@@ -228,44 +228,72 @@
+   return {};
+ }
+ 
+-// 判断是否为基础字体（不应被处理）
+-static bool IsBasicFont(const std::string& font_family) {
+-  static const std::set<std::string> basic_fonts = {
+-    // 系统特殊字体
+-    "-webkit-standard",
+-    "system-ui",
+-
+-    // 基础西文字体
+-    "Arial",
+-    "Calibri",
+-    "Courier New",
+-    "Courier",
+-    "Helvetica",
+-    "Helvetica Neue",
+-    "Lucida Grande",
+-    "Microsoft Sans Serif",
+-    "MS Sans Serif",
+-    "MS Serif",
+-    "MS UI Gothic",
+-    "Roboto",
+-    "Sans",
+-    "Segoe UI",
+-    "Times New Roman",
+-    "Times",
+-
+-    // CSS通用字体
++// Veil 906: names that are not faces. CSS generic keywords, the system-font aliases Blink
++// resolves through Settings, and the X11-era "Sans". 006 exempted these together with a dozen
++// concrete faces, which is the bug: "Segoe UI" and "Microsoft Sans Serif" then returned before
++// the platform branch and were present under every persona. A generic keyword still has to be
++// exempt, because it is not a family a page can find absent -- it is the path everything else
++// falls back to.
++static bool IsGenericFontFamily(const std::string& font_family) {
++  static const std::set<std::string> generic_families = {
++    // CSS generic keywords
+     "cursive",
+     "fantasy",
++    "math",
+     "monospace",
+     "sans-serif",
+     "serif",
+-    "math",
+-
+-    // 系统字体别名
+-    "BlinkMacSystemFont"
++    // system font aliases, resolved through Settings rather than by name
++    "-webkit-standard",
++    "BlinkMacSystemFont",
++    "system-ui",
++    // the X11-era generic alias, still accepted as a family name
++    "Sans"
+   };
+ 
+-  return basic_fonts.count(font_family) > 0;
++  return generic_families.count(font_family) > 0;
++}
++
++// Veil 906: does the claimed platform present this family? Blink aliases Arial <-> Helvetica,
++// Times <-> Times New Roman and Courier <-> Courier New on every platform
++// (AlternateFamilyName(), read by FontPlatformDataCache), so a machine whose Arial resolves
++// reports Helvetica present as well. The alias is checked here for that reason: without it a
++// Windows persona would report Helvetica absent, which no Chrome on Windows does.
++static bool VeilPlatformPresentsFamily(const std::vector<std::string>& platform_fonts,
++                                       const std::string& font_family) {
++  if (std::find(platform_fonts.begin(), platform_fonts.end(), font_family) !=
++      platform_fonts.end()) {
++    return true;
++  }
++  const AtomicString& alternate = AlternateFamilyName(AtomicString(font_family.c_str()));
++  return !alternate.empty() &&
++         std::find(platform_fonts.begin(), platform_fonts.end(), alternate.Utf8()) !=
++             platform_fonts.end();
++}
++
++// Veil 906: is this family listed in a platform table other than the claimed one? Used only by
++// the same-OS branch, where the family list is the host's own and the one contradiction it can
++// still carry is a face from another operating system -- a Windows machine with "Lucida Grande"
++// or "Menlo" installed by some application reports two OSes at once, which is exactly what
++// assertion 6's font-set-belongs-to-one-os scores.
++//
++// The three tables are built once. 006 calls GetPlatformFonts() twice per font lookup and each
++// call materialises up to 541 std::strings from a braced list; scanning two more tables per
++// lookup would be the same cost again, and none of the three ever changes.
++static bool VeilFamilyBelongsToAnotherPlatform(const std::string& platform,
++                                               const std::string& font_family) {
++  static const std::vector<std::string> kWindowsFonts = GetPlatformFonts("windows");
++  static const std::vector<std::string> kMacFonts = GetPlatformFonts("macos");
++  static const std::vector<std::string> kLinuxFonts = GetPlatformFonts("linux");
++  const std::pair<const char*, const std::vector<std::string>*> kTables[] = {
++      {"windows", &kWindowsFonts}, {"macos", &kMacFonts}, {"linux", &kLinuxFonts}};
++
++  for (const auto& [name, table] : kTables) {
++    if (platform != name && VeilPlatformPresentsFamily(*table, font_family)) {
++      return true;
++    }
++  }
++  return false;
+ }
+ 
+ 
+@@ -292,8 +320,11 @@
+ 
+     const std::string requested_family = creation_params.Family().Utf8();
+ 
+-    // 基础字体直接返回，不进行任何处理
+-    if (IsBasicFont(requested_family)) {
++    // Veil 906: only generic keywords and system-font aliases return early. 006 returned here
++    // for a dozen concrete faces too, which made "Segoe UI" and "Microsoft Sans Serif" present
++    // under every persona regardless of seed and platform -- two of the three Windows families
++    // that 6.3 measured on a macOS persona.
++    if (IsGenericFontFamily(requested_family)) {
+       return font_platform_data_cache_.GetOrCreateFontPlatformData(
+           this, font_description, creation_params, alternate_font_name);
+     }
+@@ -323,33 +354,63 @@
+     uint32_t hash = std::hash<std::string>{}(fingerprint + requested_family);
+ 
+     if (spoofed_platform != current_os) {
+-      // 获取伪装平台的字体列表
+-      bool is_platform_font = std::find(platform_fonts.begin(), platform_fonts.end(),
+-                                        requested_family) != platform_fonts.end();
+-      if (is_platform_font) {
+-        // 伪装平台的字体，用当前系统的字体替代
+-        size_t index = hash % current_os_fonts.size();
+-        FontFaceCreationParams substitute_params(AtomicString(current_os_fonts[index].c_str()));
+-        return font_platform_data_cache_.GetOrCreateFontPlatformData(
+-            this, font_description, substitute_params, alternate_font_name);
+-      } else {
+-        // 非平台字体处理：95%概率隐藏
+-        float probability = static_cast<float>(hash) / static_cast<float>(std::numeric_limits<uint32_t>::max());
+-        if (probability < 0.95) {
+-          return nullptr;
+-        }
+-        // 5%概率显示，继续默认流程
++      // Veil 906: membership, not probability. The claimed platform presents a family if its
++      // canonical table lists it, and does not if the table does not -- for every seed. 006 hid
++      // a non-platform family with probability 0.95, which is how "Microsoft PhagsPa" survived
++      // onto a macOS persona: the 5% is not a rare event when a page asks about 85 families.
++      if (!VeilPlatformPresentsFamily(platform_fonts, requested_family)) {
++        return nullptr;
+       }
+-    } else {
+-      // 系统相同，随机隐藏2%的字体以生成指纹
+-      float probability = static_cast<float>(hash) / static_cast<float>(std::numeric_limits<uint32_t>::max());
+-      if (probability < 0.02) {
++      if (!VeilPlatformPresentsFamily(current_os_fonts, requested_family)) {
++        // Present on the claimed OS and absent from this one, so it has to be rendered through a
++        // host face. Walk the host table from a (seed, family)-derived offset until one resolves:
++        // 006 took current_os_fonts[hash % size] unconditionally, so whenever that face was not
++        // installed the family came back *absent* -- which is how "Avenir" and "Didot" went
++        // missing from a macOS persona while "Menlo" stayed. That made the present set a function
++        // of which random substitute happened to exist, a per-family lottery in a different
++        // costume.
++        //
++        // The advance widths this produces are still the host's, and that cannot be fixed here:
++        // reporting Menlo with Menlo's metrics needs Menlo's outlines, and a Windows host has no
++        // metric-compatible clone of it. Measured in Veil/docs/MIGRATION-UNGOOGLED.md 6.8.
++        for (size_t step = 0; step < current_os_fonts.size(); ++step) {
++          const size_t index = (static_cast<size_t>(hash) + step) % current_os_fonts.size();
++          FontFaceCreationParams substitute_params(AtomicString(current_os_fonts[index].c_str()));
++          if (const FontPlatformData* substitute =
++                  font_platform_data_cache_.GetOrCreateFontPlatformData(
++                      this, font_description, substitute_params, alternate_font_name)) {
++            return substitute;
++          }
++        }
+         return nullptr;
+       }
++      // Both tables list it, so the two operating systems ship the same face (Arial, Times New
++      // Roman, Georgia, Verdana...). Fall through unsubstituted: substituting here would replace
++      // a face whose metrics are already correct for the claim with a random other one, and it
++      // would move canvas measureText, which resolves through the same cache.
++    } else if (!VeilPlatformPresentsFamily(platform_fonts, requested_family) &&
++               VeilFamilyBelongsToAnotherPlatform(spoofed_platform, requested_family)) {
++      // Same OS: the family list is the host's own, so it is already a set one machine can have,
++      // and 006's "hide 2% of families at random" made it a set no machine can have -- measured
++      // over five seeds in 5.1j, where it also changed nothing at all for three of them. It is
++      // gone. What remains worth hiding is a face from a *different* operating system that some
++      // application installed here: a Windows machine reporting "Menlo" or "Lucida Grande" is
++      // two operating systems at once, which is the same contradiction the cross-OS branch above
++      // exists to prevent.
++      //
++      // Masking the rest of the host's set -- the Office extras, the third-party families -- is
++      // deliberately NOT done here, and the reason is measured (6.8). A strict "present only if
++      // the canonical table lists it" rule also hides the families Settings names for
++      // `serif`, `sans-serif` and `monospace`, because on a non-English host those are localised
++      // names ("宋体", "微软雅黑") that no English table contains. The generics then all fall
++      // through to the last-resort face and measure identically, which is a louder tell than the
++      // one it removes. Fixing that needs the Settings font families, which live in
++      // FontSelector rather than in FontCache -- the same dependency `972` needs to make generic
++      // resolution follow the claimed platform, so it lands there (T12) rather than here.
++      return nullptr;
+     }
+   }
+ 
+-
+   return font_platform_data_cache_.GetOrCreateFontPlatformData(
+       this, font_description, creation_params, alternate_font_name);
+ }
