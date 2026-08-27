@@ -336,14 +336,14 @@ index 0000000000..bd73046662
 +//   vertex_attribs                 mtl::kMaxVertexAttribs = gl::MAX_VERTEX_ATTRIBS (mtl_common.h:89)
 +//   *_texture_units                mtl::kMaxShaderSamplers 16 (mtl_common.h:116)
 +//   *_uniform_vectors              kDefaultUniformsMaxSize 16 KiB / 16 B per vec4 = 1024
-+//                                  (mtl_common.h:118, DisplayMtl.mm:834)
++//                                  (mtl_common.h:118, DisplayMtl.mm:835)
 +//   *_uniform_blocks               mtl::kMaxShaderUBOs 16 (mtl_common.h:102)
 +//   uniform_block_size             mtl::kMaxUBOSize 16384 (mtl_common.h:103)
 +//   varying_vectors                31 - 1 on macOS, where [[position]] is excluded (:733)
 +//   draw_buffers / color_attach.   mtl::kMaxRenderTargets 8, taken on any Apple GPU (:769)
 +//   texture_lod_bias               log2(max2DTextureSize) + 1 = 15 (:755) -- D3D11 reports 2
 +//   aliased point / line           511 and 1.0 (:763-765)
-+//   uniform_buffer_offset_align.   16 on Apple-family GPUs, 256 elsewhere (:869) -- rule (2) applies
++//   uniform_buffer_offset_align.   16 on Apple-family GPUs, 256 elsewhere (:872) -- rule (2) applies
 +inline constexpr Caps kMacOSMetal = {
 +    .active = true,
 +    .texture_size = 16384,
@@ -530,12 +530,12 @@ index 0000000000..bd73046662
 +  // divide out, and each is identical on both backends -- which is why they are computed rather than
 +  // claimed:
 +  //
-+  //   components  = 4 x vectors                renderer11_utils.cpp:1197 / DisplayMtl.mm:836
++  //   components  = 4 x vectors                renderer11_utils.cpp:1198 / DisplayMtl.mm:842
 +  //   varying     = 4 x varying vectors        renderer11_utils.cpp:1254 / DisplayMtl.mm:733
-+  //   combined blocks = vertex + fragment      renderer11_utils.cpp:1245
++  //   combined blocks = vertex + fragment      renderer11_utils.cpp:1243
 +  //   combined units  = vertex + fragment      renderer11_utils.cpp:1256 / mtl_common.h:145
 +  //   combined components = blocks * (blockSize / 4) + components
-+  //                                            renderer11_utils.cpp:1248 / DisplayMtl.mm:886
++  //                                            renderer11_utils.cpp:1248 / DisplayMtl.mm:887
 +  caps.combined_texture_image_units =
 +      caps.vertex_texture_units + caps.fragment_texture_units;
 +  caps.vertex_uniform_components = 4 * caps.vertex_uniform_vectors;
