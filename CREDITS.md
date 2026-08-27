@@ -53,11 +53,13 @@ own — see **Veil** below.
 
 [`clearcotelabs/clearcote-browser`][cc] — BSD-3-Clause.
 
-Source of the Tier 2 patch set: `screen` and media queries, `mediaDevices`, `mediaCapabilities`,
-speech voices, device sensors, `getBattery`, `navigator.connection`, keyboard layout, storage quota,
-`performance.memory`, geolocation, WebGPU coherence, and the TLS JA3/JA4 + HTTP/2 persona. Its
-dedicated coherence patches (`092-language-locale-coherence`, `075-webgpu-coherence`,
-`160-coherence-misc`) are the reference for keeping surfaces from contradicting each other.
+Source of the Tier 2 patch set: `screen` and media queries, the WebGL capability block, `mediaDevices`,
+`mediaCapabilities`, speech voices, device sensors, `getBattery`, `navigator.connection`, keyboard
+layout, storage quota, `performance.memory`, geolocation, WebGPU coherence, and the TLS JA3/JA4 +
+HTTP/2 persona. Its dedicated coherence patches (`092-language-locale-coherence`,
+`075-webgpu-coherence`, `160-coherence-misc`) are the reference for keeping surfaces from contradicting
+each other, and `070-webgl-gpu`'s downward-clamp argument — never report a limit above what the driver
+can deliver, because an upward claim is falsifiable by allocation — is carried into Veil's `963`.
 
 ## Brave
 
@@ -90,6 +92,20 @@ Present in this range today:
 - `902-chromium-version-from-the-build` — derives the Chromium version UA-CH reports from
   `PRODUCT_VERSION` instead of `002`'s table, which was frozen at the Chromium
   `fingerprint-chromium` was built from and made the engine claim two versions at once.
+- `906-font-fingerprint-one-os-and-deterministic-absence` — fixes four independent mechanisms in
+  `006` that put two operating systems' system fonts in one list, and makes a family's absence
+  deterministic instead of a per-family lottery.
+- `960-display-panel` — reads `--fingerprint-screen-{width,height}` and
+  `--fingerprint-device-scale-factor`, which `000` had declared and nothing had read, and derives the
+  work area, colour depth, orientation and `isExtended` from the panel and the claimed platform.
+  Rewritten against clearcote's `140-screen` + `141-media-queries` rather than ported, because both
+  read a persona struct Veil deliberately does not carry.
+- `963-webgl-capability-profile` — the capability half of `011`: the `getParameter` limits, their
+  WebGL2 block and the extension list follow the same platform claim the renderer *name* follows,
+  instead of leaving the real card's numbers beside a spoofed name. Two tables transcribed from
+  ANGLE's own D3D11 and Metal backends, clamped down to the live driver, with every algebraically
+  dependent limit derived after the clamp. Takes the call-site set and the clamp argument from
+  clearcote's `070-webgl-gpu`; the numbers, the derivation and the extension handling are Veil's.
 
 ## Notes on licensing
 

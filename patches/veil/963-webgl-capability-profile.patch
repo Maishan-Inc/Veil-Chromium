@@ -1,0 +1,897 @@
+# Origin:  clearcotelabs/clearcote-browser -- the call sites and two of the rules, not the code.
+# Source:  patches/070-webgl-gpu.patch (the non-bridge slice)
+# Commit:  clearcote-browser-main tarball, audited 2026-08-24 (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: substantial -- a rewrite, and the header says so rather than claiming a port. What
+#          transferred from `070` is the *set of getters that have to move together* and its
+#          downward-clamp argument; every number, the derivation and the extension handling are Veil's.
+#
+#          Point by point, against the source patch:
+#          - the `ungoogled::CurrentPersona()` rung is deleted everywhere, and with it the whole
+#            `webgl_*` half of clearcote's persona struct (6.9: *one identity, one source, and the
+#            source is the one the UI can name*). `070`'s `--fingerprint-gpu-vendor` /
+#            `--fingerprint-gpu-renderer` are **not** taken either: `011` already picks the pair from
+#            a table indexed by `--fingerprint` and `--fingerprint-platform`, so a switch here would
+#            be a second source for a fact Veil already sends. The capabilities follow the same
+#            platform claim the name follows, which is the only arrangement in which the two cannot
+#            disagree.
+#          - the numbers do not come from `070`. Its table is a single Windows-shaped set carried on
+#            the persona -- validated as *plausible Windows* by Veil's own probe v4 capture (6.6,
+#            finding 4) and therefore wrong for the macOS persona this patch exists to fix. Veil's two
+#            tables are transcribed from ANGLE's own backends in this tree, field by field, with the
+#            site for each in `veil_webgl_caps.h`.
+#          - the downward clamp is kept, and its reasoning is `070`'s: an upward claim is falsifiable
+#            by allocation. Two rules are added beside it. Alignments clamp *upward*
+#            (UNIFORM_BUFFER_OFFSET_ALIGNMENT is a constraint on the page's own calls, not a
+#            capability). And every algebraically dependent limit is **derived after the clamp** rather
+#            than stored -- see "the clamp breaks the algebra" below, which is a defect in `070` that
+#            Veil's own assertion 6 rule now scores.
+#          - `070`'s canvas-bridge content -- `webgl_object.h`'s `BridgeId`, `RecordWebGLOp`,
+#            `RecordWebGLCreate` and ~40 forwarding hunks -- is not taken. It is a remote-render
+#            transport, not a fingerprint surface.
+#          - `070`'s `readPixels` hunk is not taken: Veil's `016` already owns that surface, and its
+#            farbling-seed variant belongs to T20.
+#          - `070`'s mobile shader-precision profile is not taken, and measuring why is one of this
+#            patch's results: **both** backends set every float precision to IEEE and every int to
+#            32-bit two's complement, so a macOS persona's twelve `getShaderPrecisionFormat` triples
+#            are already correct on a D3D11 host. `070` moves them only on its `persona.mobile`
+#            branch, which Veil has no equivalent of (T24).
+#          - `070`'s `getInternalformatParameter(SAMPLES)` filter is not taken, because MAX_SAMPLES is
+#            not spoofed: both backends resolve it from a runtime device query, so the Apple value is
+#            not derivable in this tree. Recorded, not guessed.
+#          - `070`'s persona extension list is not taken. `webgl_extensions` is populated *only* from
+#            an imported `--fingerprint-profile` JSON, so the switch-only shape inherits no list at all
+#            (6.5, 6.9) -- and the direction matters more than the source: see "subtractive only".
+#
+# Veil-authored `9NN` numbering: `963` has no `063` to correct. It is the capability half of `011`,
+# whose known weakness has been recorded in its own header since it landed.
+#
+# ---------------------------------------------------------------------------------------------
+#
+# The WebGL cross-check: 19 getParameter limits, the WebGL2 block, and one extension.
+#
+# `011` swaps the renderer *string* and leaves every number beside it at the host's value. Measured
+# (5.1n): a build claiming `ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)` still
+# reported a 32767x32767 viewport, 65536-byte uniform blocks and 4095 vertex uniform vectors -- a
+# D3D11/NVIDIA machine wearing an Apple name. Cross-referencing a claimed model against its
+# capabilities is a standard check, so the name on its own bought little and, in a scoring model that
+# counts contradictions, less than nothing.
+#
+# What moves, and where the numbers come from. Two tables, one per ANGLE backend, transcribed from
+# this tree -- `renderer11_utils.cpp` for D3D11 and `DisplayMtl.mm` + `mtl_common.h` for Metal -- with
+# the file and line for every field in `veil_webgl_caps.h`. Not a corpus, not a vendor PDF: the code
+# that would run on the machine being claimed. The table is selected by `--fingerprint-platform`,
+# which is what `011` selects the name with, and `--disable-spoofing=gpu` turns both off together.
+#
+# The eight leaves this changes for the committed `persona` case, all in `webgl`:
+#
+#   MAX_VIEWPORT_DIMS                        32767x32767 -> 16384x16384
+#   MAX_VERTEX_UNIFORM_VECTORS                      4095 -> 1024
+#   MAX_VERTEX_UNIFORM_COMPONENTS                  16380 -> 4096      (derived, 4x)
+#   MAX_UNIFORM_BLOCK_SIZE                         65536 -> 16384
+#   MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS        212988 -> 53248     (derived)
+#   MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS      200704 -> 53248     (derived)
+#   ALIASED_POINT_SIZE_RANGE                     [1,1024] -> [1,511]
+#   supportedExtensions                    OVR_multiview2 removed
+#
+# and three the claim asks for that this host refuses, which is the clamp working:
+# MAX_TEXTURE_LOD_BIAS stays 2 (Metal reports 15), the four uniform-block counts stay 12/12/24/24
+# (Metal reports 16/16/32/32), and UNIFORM_BUFFER_OFFSET_ALIGNMENT stays 256 (Apple reports 16). A
+# claimed limit is never reported above what the live driver reports, because an upward claim is
+# falsifiable in one line -- allocate the texture, link the shader, bind the uniform block, watch it
+# fail -- while a lower limit is a legal GL implementation on any hardware. The persona's capability
+# set is therefore the *intersection* of the claimed device and the host device, and the residual is a
+# passive mismatch against a spec sheet the page has to have brought with it rather than a refutation
+# it can perform.
+#
+# The clamp breaks the algebra, and that is why the dependents are derived.
+#
+# ANGLE computes nine of these limits from the others, identically on both backends: components are 4x
+# vectors, the combined block count is the sum of the two stage counts, and a combined component count
+# is blocks * (blockSize / 4) + components. A page can redo that arithmetic in one line. Clamp two
+# independents by different amounts -- which is exactly what a mixed host does -- and any *stored*
+# dependent matches neither: the macOS table's own 69632 combined components is 4096 + 16 * 4096, and
+# after this host clamps the block count to 12 and the block size to 16384 the only consistent answer
+# is 53248.
+#
+# `070` gets this right for one of the three groups and wrong for another, which is what makes the rule
+# worth having rather than obvious. It spoofs MAX_VARYING_VECTORS and *derives* the three "components"
+# limits from it as 4x -- its own comment argues exactly this case. But it also spoofs the two stage
+# uniform-block counts and the two per-stage uniform-component counts while leaving
+# MAX_UNIFORM_BLOCK_SIZE and **both** MAX_COMBINED_*_UNIFORM_COMPONENTS on the driver (all three are
+# context lines in its diff, unchanged). Those five numbers are one equation, so unless the spoofed
+# values happen to equal the host's, the equation no longer holds -- a contradiction in the same table
+# the patch exists to make coherent. `963` computes every dependent after the clamp, from the clamped
+# independents, so all nine relations hold by construction, and
+# `coherence.mjs`'s `gpu-limits-are-arithmetically-consistent` scores them. That rule needs no spec
+# sheet and no hardware table: only the arithmetic, which is this file's charter.
+#
+# Subtractive only, on the extension list.
+#
+# `getSupportedExtensions()` and `getExtension()` both answer from `disabled_extensions_` through
+# `ExtensionSupportedAndAllowed()`, so one insertion in the constructor moves both and they cannot
+# contradict each other. That choke point exists for removal and has no counterpart for addition: a
+# name added to the list is a name `getExtension()` returns null for, which is a contradiction a page
+# finds in one line. So the ASTC / ETC / PVRTC families that every Apple GPU has and no D3D11 host does
+# stay absent, recorded as a residual rather than fabricated.
+#
+# One name is removed, and it is settled in this tree rather than from a hardware table: three ANGLE
+# backends set `extensions.multiviewOVR` -- `renderer11_utils.cpp:1339`, `renderergl_utils.cpp:1603`,
+# `vk_caps_utils.cpp:1329` -- and the Metal backend never mentions it, so `GL_OVR_multiview2` is
+# present on this host and absent on every Mac. The S3TC / RGTC / BPTC families are *not* removed even
+# though they look like the same kind of tell: `[MTLDevice supportsBCTextureCompression]` decides them
+# at runtime (`mtl_format_table_autogen.mm:4114`), so which Apple parts have them is a hardware fact
+# this tree does not carry, and `011`'s macOS table spans eleven models. Guessing would trade a known
+# residual for an unknown one.
+#
+# Not covered, and each recorded rather than guessed: MAX_SAMPLES (a runtime device query on both
+# backends), the colour/depth/stencil bit counts (they describe the drawing buffer Chromium allocated
+# for the attributes the page asked for, not the device), and Linux (ANGLE's GL backend passes the
+# driver's own limits through, so there is no fixed table to transcribe -- a `linux` persona keeps the
+# host's numbers, which is the state `011` already left it in).
+#
+# No switch. `veil-patched` stays at twelve, `fingerprintFieldState()` keeps `webgl_vendor` and
+# `webgl_renderer` *unsupported* -- the user still cannot choose the GPU, and this patch does not
+# change that -- and the only mirror that moves is `coherence.mjs`, which gains the `gpuLimits`
+# surface and the arithmetic rule.
+#
+
+diff --git a/third_party/blink/renderer/modules/webgl/BUILD.gn b/third_party/blink/renderer/modules/webgl/BUILD.gn
+--- a/third_party/blink/renderer/modules/webgl/BUILD.gn
++++ b/third_party/blink/renderer/modules/webgl/BUILD.gn
+@@ -80,6 +80,7 @@
+     "oes_vertex_array_object.h",
+     "ovr_multiview_2.cc",
+     "ovr_multiview_2.h",
++    "veil_webgl_caps.h",
+     "webgl2_rendering_context.cc",
+     "webgl2_rendering_context.h",
+     "webgl2_rendering_context_base.cc",
+
+diff --git a/third_party/blink/renderer/modules/webgl/veil_webgl_caps.h b/third_party/blink/renderer/modules/webgl/veil_webgl_caps.h
+new file mode 100644
+index 0000000000..bd73046662
+--- /dev/null
++++ b/third_party/blink/renderer/modules/webgl/veil_webgl_caps.h
+@@ -0,0 +1,444 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The WebGL capability set the claimed GPU implies -- the other half of `011`.
++//
++// `011` answers UNMASKED_RENDERER_WEBGL from a table indexed by `--fingerprint` and
++// `--fingerprint-platform`, and leaves every number beside it at the host's value. Measured: a build
++// claiming an Apple M3 still reported the real card's 32767x32767 viewport, its 65536-byte uniform
++// blocks and its 4095 vertex uniform vectors (Veil/docs/MIGRATION-UNGOOGLED.md 5.1n). Cross-checking a
++// claimed model against its limits is a standard check, so the name on its own was worth little and in
++// some scoring models less than nothing. This header is the capability half, and it follows the same
++// platform claim the name follows -- no switch of its own, because a `--fingerprint-gpu-*` beside
++// `011`'s table would be a second source for one fact (6.9).
++//
++// Three rules, and they are the difference between this and a table of numbers.
++//
++// (1) DOWNWARD ONLY. A limit is never reported above what the live driver reports, because an upward
++//     claim is falsifiable in one line: the page allocates the texture, links the shader, binds the
++//     uniform block, and watches it fail. A *lower* limit is a legal GL implementation on any
++//     hardware, so under-claiming is at worst a passive mismatch against a spec sheet the page has to
++//     have brought with it. The trade is deliberate: a passive mismatch beats an active refutation.
++//
++// (2) ALIGNMENTS UPWARD. UNIFORM_BUFFER_OFFSET_ALIGNMENT is not a capability, it is a constraint on
++//     the page's own calls. Reporting 16 where the driver enforces 256 makes
++//     `bindBufferRange(..., 16, ...)` fail on an offset the page was just told was legal. So this one
++//     is max(claimed, real): never finer than the driver enforces.
++//
++// (3) DERIVE, DO NOT STORE. ANGLE computes nine of these numbers from the others, by the same
++//     arithmetic on both backends: components are 4x vectors, the combined block count is the sum of
++//     the two stage counts, and a combined component count is blocks * (blockSize / 4) + components.
++//     A page can redo that arithmetic in one line. Storing a spoofed value for a derived limit is a
++//     self-contradiction that rule (1) makes *more* likely rather than less: clamp two independents by
++//     different amounts and a stored dependent matches neither. So every dependent is computed here,
++//     after the clamp, from the clamped independents, and the relations hold by construction.
++//
++// Where the numbers come from. Not a corpus and not a vendor PDF: ANGLE's own backends, in this tree,
++// which is the code that runs on the machine being claimed. Each field carries its site.
++//
++//   windows -> third_party/angle/src/libANGLE/renderer/d3d/d3d11/renderer11_utils.cpp
++//   macos   -> third_party/angle/src/libANGLE/renderer/metal/DisplayMtl.mm + mtl_common.h
++//
++// The windows table is also the one number set this host can check: it is a D3D11/NVIDIA machine, so
++// every windows value below must come back bit-identical to the unpatched capture. That is this
++// patch's control, and it is why the table is a transcription rather than a preference.
++//
++// Not covered, and recorded rather than guessed:
++//
++//   - MAX_SAMPLES. D3D11 defers it to per-format sample counts (renderer11_utils.cpp:1268) and Metal
++//     probes `supportsTextureSampleCount:` over {2,4,8} (mtl_format_utils.mm:105). Both are runtime
++//     device queries, so the Apple value is not derivable in this tree. Left at the host's.
++//   - The compressed-texture extension families. `[MTLDevice supportsBCTextureCompression]` decides
++//     whether a Mac has S3TC/RGTC/BPTC at all (mtl_format_table_autogen.mm:4114) -- another runtime
++//     query -- and ASTC/ETC/PVRTC, which every Apple GPU has and no D3D11 host does, can only be
++//     *added*, which `getExtension()` would refute in the same line. Only `OVR_multiview2` is settled
++//     in-tree: three backends set it and the Metal backend never does.
++//   - RED_/GREEN_/BLUE_/ALPHA_/DEPTH_/STENCIL_BITS, SAMPLES, SAMPLE_BUFFERS. These describe the
++//     drawing buffer Chromium allocated for the attributes the page asked for, not the device.
++//   - Linux. ANGLE's GL backend passes the driver's own limits through, so there is no fixed table to
++//     transcribe. A `--fingerprint-platform=linux` persona keeps the host's numbers, which is the
++//     pre-existing state `011` left; the caps here are inert rather than wrong.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_VEIL_WEBGL_CAPS_H_
++#define THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_VEIL_WEBGL_CAPS_H_
++
++#include <cstdint>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
++#include "components/ungoogled/ungoogled_switches.h"
++#include "gpu/command_buffer/client/gles2_interface.h"
++
++namespace blink {
++namespace veil_webgl_caps {
++
++// One resolved answer for every WebGL limit this patch reports. `active` is false whenever the
++// claim does not apply -- no seed, GPU spoofing opted out, or a platform with no table -- and every
++// call site is written so that `!active` means "do exactly what stock Chromium did".
++//
++// The first block is what a backend fixes; the second is computed from the first by Resolve() and is
++// never written by a table. `int64_t` on the two combined component counts because GL reports them
++// through GetInteger64v and the D3D11 values overflow nothing but read as int64 in ANGLE too.
++struct Caps {
++  bool active = false;
++
++  // Fixed by the claimed backend.
++  int32_t texture_size = 0;
++  int32_t cube_map_texture_size = 0;
++  int32_t renderbuffer_size = 0;
++  int32_t viewport_dim = 0;
++  int32_t texture_3d_size = 0;
++  int32_t array_texture_layers = 0;
++  int32_t vertex_attribs = 0;
++  int32_t vertex_texture_units = 0;
++  int32_t fragment_texture_units = 0;
++  int32_t vertex_uniform_vectors = 0;
++  int32_t fragment_uniform_vectors = 0;
++  int32_t vertex_uniform_blocks = 0;
++  int32_t fragment_uniform_blocks = 0;
++  int32_t uniform_block_size = 0;
++  int32_t varying_vectors = 0;
++  int32_t draw_buffers = 0;
++  int32_t color_attachments = 0;
++  int32_t uniform_buffer_offset_alignment = 0;
++  float texture_lod_bias = 0.f;
++  float aliased_point_size_min = 0.f;
++  float aliased_point_size_max = 0.f;
++  float aliased_line_width_min = 0.f;
++  float aliased_line_width_max = 0.f;
++
++  // Derived from the block above, after the clamp. Rule (3).
++  int32_t combined_texture_image_units = 0;
++  int32_t vertex_uniform_components = 0;
++  int32_t fragment_uniform_components = 0;
++  int32_t varying_components = 0;
++  int32_t combined_uniform_blocks = 0;
++  int32_t uniform_buffer_bindings = 0;
++  int64_t combined_vertex_uniform_components = 0;
++  int64_t combined_fragment_uniform_components = 0;
++};
++
++// ANGLE's D3D11 backend at feature level 11_0, which is what `011`'s Windows table claims: every
++// entry in it is an NVIDIA card, and NVIDIA is the one vendor for which ANGLE subtracts a vertex
++// constant register.
++//
++//   texture / cube / renderbuffer  GetMaximum{2DTextureSize,CubeMapTextureSize} -- D3D11_REQ_TEXTURE2D
++//   viewport_dim                   GetMaximumViewportSize -> D3D11_VIEWPORT_BOUNDS_MAX (:425)
++//   texture_3d_size                D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
++//   array_texture_layers           D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION
++//   vertex_attribs                 clamped by the front end to gl::MAX_VERTEX_ATTRIBS
++//   *_texture_units                D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT (:612)
++//   vertex_uniform_vectors         D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT (4096) minus 1 for
++//                                  features.skipVSConstantRegisterZero, which is `isNvidia` (:2183)
++//   fragment_uniform_vectors       GetMaximumPixelUniformVectors -- hard-coded 1024 (:632)
++//   *_uniform_blocks               API_SLOT_COUNT 14 minus RESERVED 2 (:536)
++//   uniform_block_size             GetMaximumConstantBufferSize -- 4096 elements x 16 B (:852)
++//   varying_vectors                D3D11_VS_OUTPUT_REGISTER_COUNT 32 minus 2 reserved (:588)
++//   draw_buffers / color_attach.   GetMaximumSimultaneousRenderTargets
++//   texture_lod_bias               "Unimplemented, set to minimum required" -- 2.0 (:1144)
++//   aliased point / line           1024 and 1.0, both hard-coded (:1160)
++//   uniform_buffer_offset_align.   256, the DirectX 11.1 constant-buffer rule (:1241)
++inline constexpr Caps kWindowsD3D11 = {
++    .active = true,
++    .texture_size = 16384,
++    .cube_map_texture_size = 16384,
++    .renderbuffer_size = 16384,
++    .viewport_dim = 32767,
++    .texture_3d_size = 2048,
++    .array_texture_layers = 2048,
++    .vertex_attribs = 16,
++    .vertex_texture_units = 16,
++    .fragment_texture_units = 16,
++    .vertex_uniform_vectors = 4095,
++    .fragment_uniform_vectors = 1024,
++    .vertex_uniform_blocks = 12,
++    .fragment_uniform_blocks = 12,
++    .uniform_block_size = 65536,
++    .varying_vectors = 30,
++    .draw_buffers = 8,
++    .color_attachments = 8,
++    .uniform_buffer_offset_alignment = 256,
++    .texture_lod_bias = 2.f,
++    .aliased_point_size_min = 1.f,
++    .aliased_point_size_max = 1024.f,
++    .aliased_line_width_min = 1.f,
++    .aliased_line_width_max = 1.f,
++};
++
++// ANGLE's Metal backend on macOS, which is what `011`'s macOS table claims -- every entry there is an
++// Apple M-series part, so the TARGET_OS_OSX branch is the whole story and no Intel-Mac variant is
++// needed. Line numbers are DisplayMtl.mm unless marked.
++//
++//   texture / cube / renderbuffer  max2DTextureSize 16384 on macOS (:731), cube and renderbuffer are
++//                                  assigned from it (:756-757)
++//   viewport_dim                   maxViewportWidth = max2DTextureSize (:782) -- 16384, not D3D11's
++//                                  32767, and the one limit that says "Metal" on its own
++//   texture_3d_size                2048 (:729)
++//   array_texture_layers           2048 (:754)
++//   vertex_attribs                 mtl::kMaxVertexAttribs = gl::MAX_VERTEX_ATTRIBS (mtl_common.h:89)
++//   *_texture_units                mtl::kMaxShaderSamplers 16 (mtl_common.h:116)
++//   *_uniform_vectors              kDefaultUniformsMaxSize 16 KiB / 16 B per vec4 = 1024
++//                                  (mtl_common.h:118, DisplayMtl.mm:834)
++//   *_uniform_blocks               mtl::kMaxShaderUBOs 16 (mtl_common.h:102)
++//   uniform_block_size             mtl::kMaxUBOSize 16384 (mtl_common.h:103)
++//   varying_vectors                31 - 1 on macOS, where [[position]] is excluded (:733)
++//   draw_buffers / color_attach.   mtl::kMaxRenderTargets 8, taken on any Apple GPU (:769)
++//   texture_lod_bias               log2(max2DTextureSize) + 1 = 15 (:755) -- D3D11 reports 2
++//   aliased point / line           511 and 1.0 (:763-765)
++//   uniform_buffer_offset_align.   16 on Apple-family GPUs, 256 elsewhere (:869) -- rule (2) applies
++inline constexpr Caps kMacOSMetal = {
++    .active = true,
++    .texture_size = 16384,
++    .cube_map_texture_size = 16384,
++    .renderbuffer_size = 16384,
++    .viewport_dim = 16384,
++    .texture_3d_size = 2048,
++    .array_texture_layers = 2048,
++    .vertex_attribs = 16,
++    .vertex_texture_units = 16,
++    .fragment_texture_units = 16,
++    .vertex_uniform_vectors = 1024,
++    .fragment_uniform_vectors = 1024,
++    .vertex_uniform_blocks = 16,
++    .fragment_uniform_blocks = 16,
++    .uniform_block_size = 16384,
++    .varying_vectors = 30,
++    .draw_buffers = 8,
++    .color_attachments = 8,
++    .uniform_buffer_offset_alignment = 16,
++    .texture_lod_bias = 15.f,
++    .aliased_point_size_min = 1.f,
++    .aliased_point_size_max = 511.f,
++    .aliased_line_width_min = 1.f,
++    .aliased_line_width_max = 1.f,
++};
++
++// The same gate `011` applies, spelled the same way. A seed is required, and
++// `--disable-spoofing=gpu` opts out of the whole GPU story: the name and the capabilities go together,
++// because opting out of one and not the other is a contradiction the user has no way to see.
++inline bool Enabled() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line) {
++    return false;
++  }
++  if (command_line->HasSwitch(::switches::kDisableSpoofing) &&
++      command_line->GetSwitchValueASCII(::switches::kDisableSpoofing)
++              .find("gpu") != std::string::npos) {
++    return false;
++  }
++  return command_line->HasSwitch(::switches::kFingerprint);
++}
++
++// The claimed platform, lower-cased, or the empty string. Read exactly as `002`, `006`, `011` and
++// `960` read it.
++inline std::string ClaimedPlatform() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line && command_line->HasSwitch(::switches::kFingerprintPlatform)) {
++    return base::ToLowerASCII(
++        command_line->GetSwitchValueASCII(::switches::kFingerprintPlatform));
++  }
++  return std::string();
++}
++
++// The table the claim selects, before any clamping.
++//
++// An absent platform falls to the D3D11 table rather than to nothing, because that is where `011`
++// falls: `GetGLRendererStringForFingerprint()` defaults `platform` to "windows", so a seed with no
++// `--fingerprint-platform` already claims an NVIDIA card and the capabilities have to agree with the
++// name that is being reported. `linux`, `android` and `ios` return an inactive set -- there is no
++// fixed table to transcribe for ANGLE's GL backend, and a guess would be worse than the host's truth.
++inline Caps Claimed() {
++  if (!Enabled()) {
++    return Caps();
++  }
++  const std::string platform = ClaimedPlatform();
++  if (platform == "macos") {
++    return kMacOSMetal;
++  }
++  if (platform.empty() || platform == "windows") {
++    return kWindowsD3D11;
++  }
++  return Caps();
++}
++
++// Rule (1). The live driver value wins whenever the claim is larger. Reading it costs nothing a
++// getParameter did not already cost: every pname below is answered from GLES2Implementation's
++// client-side `gl_capabilities_` without a round trip (gles2_implementation.cc:925-1200).
++inline int32_t ClampDown(gpu::gles2::GLES2Interface* gl, GLenum pname, int32_t want) {
++  GLint real = 0;
++  gl->GetIntegerv(pname, &real);
++  return (real > 0 && want > real) ? static_cast<int32_t>(real) : want;
++}
++
++inline float ClampDownF(gpu::gles2::GLES2Interface* gl, GLenum pname, float want) {
++  GLfloat real = 0.f;
++  gl->GetFloatv(pname, &real);
++  return (real > 0.f && want > real) ? static_cast<float>(real) : want;
++}
++
++// GL_MAX_VIEWPORT_DIMS writes two ints, so it needs its own reader: handing GetIntegerv a single
++// GLint* smashes the stack. Veil claims one square limit, as both backends report.
++inline int32_t ClampDownViewport(gpu::gles2::GLES2Interface* gl, int32_t want) {
++  GLint real[2] = {0, 0};
++  gl->GetIntegerv(GL_MAX_VIEWPORT_DIMS, real);
++  const GLint cap = real[0] < real[1] ? real[0] : real[1];
++  return (cap > 0 && want > cap) ? static_cast<int32_t>(cap) : want;
++}
++
++// GL_ALIASED_POINT_SIZE_RANGE and GL_ALIASED_LINE_WIDTH_RANGE write two floats each, so they need the
++// same treatment GL_MAX_VIEWPORT_DIMS does. Only the upper end is clamped: both backends report a
++// minimum of exactly 1.0, and a *smaller* minimum would be a claim to draw finer points than the
++// driver can.
++inline float ClampDownRangeMaxF(gpu::gles2::GLES2Interface* gl,
++                                GLenum pname,
++                                float want) {
++  GLfloat real[2] = {0.f, 0.f};
++  gl->GetFloatv(pname, real);
++  return (real[1] > 0.f && want > real[1]) ? static_cast<float>(real[1]) : want;
++}
++
++// Rule (2). A coarser alignment than the claim is still legal for the page; a finer one is not.
++inline int32_t ClampUp(gpu::gles2::GLES2Interface* gl, GLenum pname, int32_t want) {
++  GLint real = 0;
++  gl->GetIntegerv(pname, &real);
++  return (real > want) ? static_cast<int32_t>(real) : want;
++}
++
++// The claim, clamped against this driver, with every dependent recomputed from the clamped
++// independents. Rule (3): the derived block is written here and nowhere else, so no table can put a
++// stored dependent out of step with the values it is supposed to follow from.
++//
++// `es3` says whether the caller's context can answer ES3 queries, and it is not a convenience.
++// GLES2Implementation::GetHelper() returns early for every ES3 pname when the context is ES2
++// (gles2_implementation.cc:1114), so reading one on a WebGL1 context falls through to the service and
++// raises GL_INVALID_ENUM -- a getError() a page can see, on a call stock Chromium makes silently. The
++// WebGL1 getParameter arms pass false and report only the ES2 block; the WebGL2 arms pass true. When
++// it is false the ES3 independents keep their table values unclamped, which is harmless precisely
++// because that path never reports them.
++//
++// Cheap enough to call per getParameter -- see ClampDown -- so there is no cached copy of this on the
++// context and therefore no second answer that could go stale across a context loss.
++inline Caps Resolve(gpu::gles2::GLES2Interface* gl, bool es3) {
++  Caps caps = Claimed();
++  if (!caps.active || !gl) {
++    return Caps();
++  }
++
++  caps.texture_size = ClampDown(gl, GL_MAX_TEXTURE_SIZE, caps.texture_size);
++  caps.cube_map_texture_size =
++      ClampDown(gl, GL_MAX_CUBE_MAP_TEXTURE_SIZE, caps.cube_map_texture_size);
++  caps.renderbuffer_size =
++      ClampDown(gl, GL_MAX_RENDERBUFFER_SIZE, caps.renderbuffer_size);
++  caps.viewport_dim = ClampDownViewport(gl, caps.viewport_dim);
++  caps.vertex_attribs = ClampDown(gl, GL_MAX_VERTEX_ATTRIBS, caps.vertex_attribs);
++  caps.vertex_texture_units = ClampDown(gl, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS,
++                                        caps.vertex_texture_units);
++  caps.fragment_texture_units =
++      ClampDown(gl, GL_MAX_TEXTURE_IMAGE_UNITS, caps.fragment_texture_units);
++  caps.vertex_uniform_vectors = ClampDown(gl, GL_MAX_VERTEX_UNIFORM_VECTORS,
++                                          caps.vertex_uniform_vectors);
++  caps.fragment_uniform_vectors = ClampDown(gl, GL_MAX_FRAGMENT_UNIFORM_VECTORS,
++                                            caps.fragment_uniform_vectors);
++  caps.varying_vectors =
++      ClampDown(gl, GL_MAX_VARYING_VECTORS, caps.varying_vectors);
++  caps.aliased_point_size_max = ClampDownRangeMaxF(
++      gl, GL_ALIASED_POINT_SIZE_RANGE, caps.aliased_point_size_max);
++  caps.aliased_line_width_max = ClampDownRangeMaxF(
++      gl, GL_ALIASED_LINE_WIDTH_RANGE, caps.aliased_line_width_max);
++
++  // The ES3 block. Everything above is an ES2 query and safe on either context.
++  if (es3) {
++    caps.texture_3d_size =
++        ClampDown(gl, GL_MAX_3D_TEXTURE_SIZE, caps.texture_3d_size);
++    caps.array_texture_layers =
++        ClampDown(gl, GL_MAX_ARRAY_TEXTURE_LAYERS, caps.array_texture_layers);
++    caps.vertex_uniform_blocks =
++        ClampDown(gl, GL_MAX_VERTEX_UNIFORM_BLOCKS, caps.vertex_uniform_blocks);
++    caps.fragment_uniform_blocks = ClampDown(gl, GL_MAX_FRAGMENT_UNIFORM_BLOCKS,
++                                             caps.fragment_uniform_blocks);
++    caps.uniform_block_size =
++        ClampDown(gl, GL_MAX_UNIFORM_BLOCK_SIZE, caps.uniform_block_size);
++    caps.draw_buffers = ClampDown(gl, GL_MAX_DRAW_BUFFERS, caps.draw_buffers);
++    caps.color_attachments =
++        ClampDown(gl, GL_MAX_COLOR_ATTACHMENTS, caps.color_attachments);
++    caps.texture_lod_bias =
++        ClampDownF(gl, GL_MAX_TEXTURE_LOD_BIAS, caps.texture_lod_bias);
++    caps.uniform_buffer_offset_alignment =
++        ClampUp(gl, GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT,
++                caps.uniform_buffer_offset_alignment);
++  }
++
++  // The nine derived limits, in the two forms ANGLE writes them in. Each relation is a line a page can
++  // divide out, and each is identical on both backends -- which is why they are computed rather than
++  // claimed:
++  //
++  //   components  = 4 x vectors                renderer11_utils.cpp:1197 / DisplayMtl.mm:836
++  //   varying     = 4 x varying vectors        renderer11_utils.cpp:1254 / DisplayMtl.mm:733
++  //   combined blocks = vertex + fragment      renderer11_utils.cpp:1245
++  //   combined units  = vertex + fragment      renderer11_utils.cpp:1256 / mtl_common.h:145
++  //   combined components = blocks * (blockSize / 4) + components
++  //                                            renderer11_utils.cpp:1248 / DisplayMtl.mm:886
++  caps.combined_texture_image_units =
++      caps.vertex_texture_units + caps.fragment_texture_units;
++  caps.vertex_uniform_components = 4 * caps.vertex_uniform_vectors;
++  caps.fragment_uniform_components = 4 * caps.fragment_uniform_vectors;
++  caps.varying_components = 4 * caps.varying_vectors;
++  caps.combined_uniform_blocks =
++      caps.vertex_uniform_blocks + caps.fragment_uniform_blocks;
++  caps.uniform_buffer_bindings = caps.combined_uniform_blocks;
++  caps.combined_vertex_uniform_components =
++      static_cast<int64_t>(caps.vertex_uniform_blocks) *
++          static_cast<int64_t>(caps.uniform_block_size / 4) +
++      caps.vertex_uniform_components;
++  caps.combined_fragment_uniform_components =
++      static_cast<int64_t>(caps.fragment_uniform_blocks) *
++          static_cast<int64_t>(caps.uniform_block_size / 4) +
++      caps.fragment_uniform_components;
++  return caps;
++}
++
++// Convenience for the call sites, so a getParameter arm reads as one condition:
++//
++//   if (Caps caps; veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps))
++//     return WebGLAny(script_state, caps.texture_size);
++//   return GetIntParameter(script_state, pname);   // unchanged stock path
++inline bool Resolved(gpu::gles2::GLES2Interface* gl, bool es3, Caps* out) {
++  *out = Resolve(gl, es3);
++  return out->active;
++}
++
++// Extensions the claimed platform cannot have. Subtractive only, and for a reason that is not
++// caution: `getSupportedExtensions()` and `getExtension()` both answer from
++// WebGLRenderingContextBase::disabled_extensions_ through ExtensionSupportedAndAllowed(), so removing
++// a name here moves both and they cannot disagree. *Adding* one has no such choke point -- the list
++// would name an extension `getExtension()` returns null for, which is a contradiction a page finds in
++// one line, so the ASTC/ETC/PVRTC families every Apple GPU has stay absent and are recorded as a
++// residual instead.
++//
++// One entry, and it is settled in this tree rather than from a vendor table: three ANGLE backends set
++// `extensions.multiviewOVR` -- renderer11_utils.cpp:1339, renderergl_utils.cpp:1603,
++// vk_caps_utils.cpp:1329 -- and the Metal backend never mentions it, so GL_OVR_multiview2 exists on
++// this D3D11 host and on no Mac. Blink gates the WebGL extension on exactly that string and names it
++// "OVR_multiview2" (ovr_multiview_2.cc:85, :88), which is the name disabled_extensions_ matches.
++inline constexpr const char* kMacOSAbsentExtensions[] = {"OVR_multiview2"};
++
++struct AbsentExtensions {
++  const char* const* names = nullptr;
++  size_t count = 0;
++};
++
++inline AbsentExtensions ClaimedAbsentExtensions() {
++  if (!Enabled() || ClaimedPlatform() != "macos") {
++    return AbsentExtensions();
++  }
++  return AbsentExtensions{kMacOSAbsentExtensions,
++                          sizeof(kMacOSAbsentExtensions) /
++                              sizeof(kMacOSAbsentExtensions[0])};
++}
++
++}  // namespace veil_webgl_caps
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_MODULES_WEBGL_VEIL_WEBGL_CAPS_H_
+
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -115,6 +115,7 @@
+ #include "third_party/blink/renderer/modules/webgl/oes_texture_half_float.h"
+ #include "third_party/blink/renderer/modules/webgl/oes_texture_half_float_linear.h"
+ #include "third_party/blink/renderer/modules/webgl/oes_vertex_array_object.h"
++#include "third_party/blink/renderer/modules/webgl/veil_webgl_caps.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_active_info.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_buffer.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_compressed_texture_astc.h"
+@@ -1398,6 +1399,18 @@
+     disabled_extensions_.insert(entry);
+   }
+ 
++  // Veil `963`: extensions the claimed platform does not have. This set is the one place both
++  // `getSupportedExtensions()` and `getExtension()` consult -- ExtensionSupportedAndAllowed() reads
++  // it for each tracker -- so a name removed here is removed from both answers and the two cannot
++  // contradict each other. Subtractive only: an extension the claim *should* have but this driver
++  // lacks stays absent, because a name in the list that `getExtension()` returns null for is a
++  // contradiction a page finds in one line. See veil_webgl_caps.h.
++  const veil_webgl_caps::AbsentExtensions veil_absent =
++      veil_webgl_caps::ClaimedAbsentExtensions();
++  for (size_t i = 0; i < veil_absent.count; ++i) {
++    disabled_extensions_.insert(String(veil_absent.names[i]));
++  }
++
+ #define ADD_VALUES_TO_SET(set, values)             \
+   for (size_t i = 0; i < std::size(values); ++i) { \
+     set.insert(values[i]);                         \
+@@ -3991,8 +4004,24 @@
+     case GL_ACTIVE_TEXTURE:
+       return GetUnsignedIntParameter(script_state, pname);
+     case GL_ALIASED_LINE_WIDTH_RANGE:
++      // Veil `963`: the claimed backend's range, clamped down to this driver's.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        const std::array<GLfloat, 2> range = {caps.aliased_line_width_min,
++                                              caps.aliased_line_width_max};
++        return WebGLAny(script_state,
++                        DOMFloat32Array::Create(base::span(range)));
++      }
+       return GetWebGLFloatArrayParameter(script_state, pname);
+     case GL_ALIASED_POINT_SIZE_RANGE:
++      // Veil `963`: D3D11 reports 1024, ANGLE's Metal backend 511.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        const std::array<GLfloat, 2> range = {caps.aliased_point_size_min,
++                                              caps.aliased_point_size_max};
++        return WebGLAny(script_state,
++                        DOMFloat32Array::Create(base::span(range)));
++      }
+       return GetWebGLFloatArrayParameter(script_state, pname);
+     case GL_ALPHA_BITS:
+       if (drawing_buffer_->RequiresAlphaChannelToBePreserved())
+@@ -4065,26 +4094,78 @@
+     case GL_LINE_WIDTH:
+       return GetFloatParameter(script_state, pname);
+     case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
++      // Veil `963`: derived -- vertex units plus fragment units, as both backends compute it.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.combined_texture_image_units);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.cube_map_texture_size);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_FRAGMENT_UNIFORM_VECTORS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.fragment_uniform_vectors);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_RENDERBUFFER_SIZE:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.renderbuffer_size);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_TEXTURE_IMAGE_UNITS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.fragment_texture_units);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_TEXTURE_SIZE:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.texture_size);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VARYING_VECTORS:
++      // Veil `963`: the one independent varying limit. WebGL2's three "components" limits are 4x
++      // this value and are computed from it, so the four cannot drift apart.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.varying_vectors);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_ATTRIBS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.vertex_attribs);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.vertex_texture_units);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_UNIFORM_VECTORS:
++      // Veil `963`: 4095 on the D3D11 table, where ANGLE subtracts one constant register on NVIDIA;
++      // 1024 on Metal, where the whole default uniform buffer is 16 KiB.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        return WebGLAny(script_state, caps.vertex_uniform_vectors);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VIEWPORT_DIMS:
++      // Veil `963`: an ANGLE-backend constant rather than a property of the card -- 32767 on D3D11,
++      // 16384 on Metal, where it follows the maximum 2D texture size.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/false, &caps)) {
++        const std::array<GLint, 2> dims = {caps.viewport_dim, caps.viewport_dim};
++        return WebGLAny(script_state, DOMInt32Array::Create(base::span(dims)));
++      }
+       return GetWebGLIntArrayParameter(script_state, pname);
+     case GL_PACK_ALIGNMENT:
+       return GetIntParameter(script_state, pname);
+
+diff --git a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+--- a/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc
+@@ -22,6 +22,7 @@
+ #include "third_party/blink/renderer/core/html/html_image_element.h"
+ #include "third_party/blink/renderer/core/html/media/html_video_element.h"
+ #include "third_party/blink/renderer/core/imagebitmap/image_bitmap.h"
++#include "third_party/blink/renderer/modules/webgl/veil_webgl_caps.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_active_info.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_buffer.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_fence_sync.h"
+@@ -4814,20 +4815,51 @@
+     case GL_FRAGMENT_SHADER_DERIVATIVE_HINT:
+       return GetUnsignedIntParameter(script_state, pname);
+     case GL_MAX_3D_TEXTURE_SIZE:
++      // Veil `963` -- see veil_webgl_caps.h for where each number comes from and what clamps it.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.texture_3d_size);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_ARRAY_TEXTURE_LAYERS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.array_texture_layers);
++      }
+       return GetIntParameter(script_state, pname);
+     case GC3D_MAX_CLIENT_WAIT_TIMEOUT_WEBGL:
+       return WebGLAny(script_state, kMaxClientWaitTimeout);
+     case GL_MAX_COLOR_ATTACHMENTS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.color_attachments);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_COMBINED_FRAGMENT_UNIFORM_COMPONENTS:
++      // Veil `963`: derived -- blocks * (blockSize / 4) + components, from the clamped independents.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.combined_fragment_uniform_components);
++      }
+       return GetInt64Parameter(script_state, pname);
+     case GL_MAX_COMBINED_UNIFORM_BLOCKS:
++      // Veil `963`: derived -- the two stage counts summed.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.combined_uniform_blocks);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_COMBINED_VERTEX_UNIFORM_COMPONENTS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.combined_vertex_uniform_components);
++      }
+       return GetInt64Parameter(script_state, pname);
+     case GL_MAX_DRAW_BUFFERS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.draw_buffers);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_ELEMENT_INDEX:
+       return GetInt64Parameter(script_state, pname);
+@@ -4836,10 +4868,24 @@
+     case GL_MAX_ELEMENTS_VERTICES:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_FRAGMENT_INPUT_COMPONENTS:
++      // Veil `963`: derived -- 4x MAX_VARYING_VECTORS, which is what both backends compute.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.varying_components);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_FRAGMENT_UNIFORM_BLOCKS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.fragment_uniform_blocks);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:
++      // Veil `963`: derived -- 4x MAX_FRAGMENT_UNIFORM_VECTORS.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.fragment_uniform_components);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_PROGRAM_TEXEL_OFFSET:
+       return GetIntParameter(script_state, pname);
+@@ -4848,6 +4894,12 @@
+     case GL_MAX_SERVER_WAIT_TIMEOUT:
+       return GetInt64Parameter(script_state, pname);
+     case GL_MAX_TEXTURE_LOD_BIAS:
++      // Veil `963`: 2.0 on D3D11, where ANGLE reports the GLES minimum; 15.0 on Metal, where it
++      // follows log2(max 2D texture size) + 1.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.texture_lod_bias);
++      }
+       return GetFloatParameter(script_state, pname);
+     case GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS:
+       return GetIntParameter(script_state, pname);
+@@ -4856,16 +4908,44 @@
+     case GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS:
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_UNIFORM_BLOCK_SIZE:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state,
++                        static_cast<int64_t>(caps.uniform_block_size));
++      }
+       return GetInt64Parameter(script_state, pname);
+     case GL_MAX_UNIFORM_BUFFER_BINDINGS:
++      // Veil `963`: derived -- the same sum as MAX_COMBINED_UNIFORM_BLOCKS, which is how both
++      // backends fill it.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.uniform_buffer_bindings);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VARYING_COMPONENTS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.varying_components);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_OUTPUT_COMPONENTS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.varying_components);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_UNIFORM_BLOCKS:
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.vertex_uniform_blocks);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MAX_VERTEX_UNIFORM_COMPONENTS:
++      // Veil `963`: derived -- 4x MAX_VERTEX_UNIFORM_VECTORS.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.vertex_uniform_components);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_MIN_PROGRAM_TEXEL_OFFSET:
+       return GetIntParameter(script_state, pname);
+@@ -4919,6 +4999,14 @@
+     case GL_UNIFORM_BUFFER_BINDING:
+       return WebGLAny(script_state, bound_uniform_buffer_.Get());
+     case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
++      // Veil `963`, rule (2): 256 on D3D11, 16 on Apple-family GPUs -- and clamped *up* to the
++      // driver's own value, never down. This one is a constraint on the page's bindBufferRange
++      // offsets, so a finer claim than the driver enforces would fail on an offset the page was told
++      // was legal.
++      if (veil_webgl_caps::Caps caps;
++          veil_webgl_caps::Resolved(ContextGL(), /*es3=*/true, &caps)) {
++        return WebGLAny(script_state, caps.uniform_buffer_offset_alignment);
++      }
+       return GetIntParameter(script_state, pname);
+     case GL_UNPACK_IMAGE_HEIGHT:
+       return GetIntParameter(script_state, pname);

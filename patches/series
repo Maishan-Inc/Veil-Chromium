@@ -40,3 +40,4 @@ veil/016-webgl-readPixels.patch
 veil/001-disable-runtime-enable.patch
 veil/902-chromium-version-from-the-build.patch
 veil/960-display-panel.patch
+veil/963-webgl-capability-profile.patch
