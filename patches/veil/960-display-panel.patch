@@ -1,0 +1,630 @@
+# Origin:  clearcotelabs/clearcote-browser -- rewritten against the same call sites, not copied.
+# Source:  patches/140-screen.patch and patches/141-media-queries.patch
+# Commit:  clearcote-browser-main tarball, audited 2026-08-24 (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: substantial -- this is a rewrite, and the header says so rather than claiming a port.
+#          Both counterparts read an `ungoogled::CurrentPersona()` struct Veil deliberately does not
+#          carry (6.9: *one identity, one source, and the source is the one the UI can name*). `140`
+#          holds 56 references to it and `141` holds 27, so there is no ladder left to copy once the
+#          middle rung goes. What is taken from clearcote is the *set of call sites* -- which getters
+#          have to move together for a display to be coherent -- and that is the expensive half.
+#
+#          Point by point, against the two source patches:
+#          - the persona rung is deleted everywhere, leaving `switch > host`. clearcote's own
+#            `ScreenIntOverride()` already had that shape (6.9), which is why this is cheap.
+#          - `--fingerprint-device-pixel-ratio` becomes `--fingerprint-device-scale-factor`: the name
+#            Veil's `000` already declares, and Chromium's own name for the quantity
+#            (`display::Display::device_scale_factor()`). Settled in 6.9, not here.
+#          - `--fingerprint-avail-width`, `--fingerprint-avail-height` and `--fingerprint-color-depth`
+#            are **not** taken. The work area is the panel minus the claimed shell's one bounded
+#            strip, and the colour depth is 24 on every desktop a persona would claim, so both are
+#            derived here. A switch for the work area is a way to fail assertion 6 R1 by hand (6.9).
+#          - `141`'s pointer / hover / dynamic-range / colour-gamut hunks and its
+#            `media_values_cached.h` default flip are left out entirely. They describe an input class
+#            and a colour space, not a display panel; `(hover:)`, `(any-pointer:)` and
+#            `(dynamic-range:)` are in Veil's baseline and must not move here. The mobile input story
+#            is T13's and T24's.
+#          - `140`'s `outerWidth`/`outerHeight` clamping is left out and its `screenX`/`screenY`
+#            offset fabrication is replaced. See "The window is real" below.
+#          - `ScreenDetailed::isInternal()` is left alone. clearcote answers it from
+#            `persona.mobile`; Veil models no laptop/desktop distinction, so there is nothing to
+#            derive it from and a guess would be a value that agrees with nothing.
+#
+# Veil-authored `9NN` numbering: `960` has no `060` to correct, so it is in the `950`-`999` range
+# reserved for patches with no direct counterpart -- which is what a rewrite is.
+#
+# ---------------------------------------------------------------------------------------------
+#
+# The display block: eight surfaces, three switches, one derivation.
+#
+# `000` has declared `--fingerprint-screen-width`, `--fingerprint-screen-height` and
+# `--fingerprint-device-scale-factor` since it was ported, propagated all three into every renderer,
+# and **nothing has ever read one**. This is the patch that reads them. Until it landed, a profile
+# could be reported as presenting a 1470x956 @2x panel while `screen.width` was still 2560 -- the
+# same defect as emitting a switch no Chromium has, and harder to see (6.9).
+#
+# Taken (the user's claim about the machine, derivable from nothing):
+#
+#   --fingerprint-screen-width=<int>          screen.width, (device-width:)
+#   --fingerprint-screen-height=<int>         screen.height, (device-height:)
+#   --fingerprint-device-scale-factor=<num>   window.devicePixelRatio, (resolution:),
+#                                             ScreenDetailed.devicePixelRatio
+#
+# Derived from the panel and from `--fingerprint-platform` (no switch, one source):
+#
+#   screen.availWidth   = panel width
+#   screen.availHeight  = panel height minus the claimed shell's reserved strip
+#   screen.availLeft    = 0
+#   screen.availTop     = the top half of that strip
+#   screen.colorDepth   = 24, and screen.pixelDepth is Blink's alias of it
+#   screen.isExtended   = false -- a persona is one display, and `true` leaks a real second monitor
+#   screen.orientation  = landscape-primary / portrait-primary from the panel's own aspect, angle 0
+#   (color: n)          = 24 / 3, so the media-query side cannot disagree with screen.colorDepth
+#
+# The reserved strip is one number per claimed shell, in `display_persona.h`. It is a statement
+# about where an operating system puts its shell, which is the only kind of claim assertion 6
+# permits -- never a hardware spec. Windows reserves 48 px at the bottom (measured: this host's own
+# 1440-px panel reports availHeight 1392), macOS 25 px at the top for the menu bar, GNOME 27 px at
+# the top. macOS is modelled with the Dock auto-hidden, because a Dock height depends on user
+# settings Veil does not model while the menu bar does not.
+#
+# **The window is real, and that is the divergence from `140` worth reading twice.** clearcote clamps
+# `outerHeight` to the persona's work area because its window may be larger than the panel it claims.
+# Veil forbids that configuration at save time instead -- `veil_core::validate` rejects a window that
+# does not fit the derived work area -- so `outerWidth`/`outerHeight` stay a true measurement of the
+# window that actually exists. What Veil cannot forbid is where the window manager *put* it: a real
+# x of 900 measured against a declared 1470-px panel puts the window off an edge the page believes
+# in. So `screenX`/`screenY` are clamped into the work area and otherwise returned unchanged, which
+# means this hunk does nothing at all on a host that placed the window inside the declared area.
+# `140`'s `16 + seed % 160` offset is not ported: a fabricated position is a second source for a fact
+# the real window already answers.
+#
+# Nothing here touches `display::ScreenInfo`, the compositor or layout. `--force-device-scale-factor`
+# is stock Chromium, works, and is *not* a cheaper version of this patch: it moves the real scale
+# factor, so the viewport and the window move with it while `screen.width` stays the host's (6.9).
+# `960` moves what JS reports and leaves the real surface alone, which is why the `default` case --
+# emitting none of the three switches -- must be byte-identical to the pre-`960` capture.
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ component("ungoogled_switches") {
+   sources = [
++    "display_persona.h",
+     "fingerprint_data.h",
+     "ungoogled_switches.h",
+     "ungoogled_switches.cc",
+
+diff --git a/components/ungoogled/display_persona.h b/components/ungoogled/display_persona.h
+new file mode 100644
+index 0000000000..3b7f10c4d2
+--- /dev/null
++++ b/components/ungoogled/display_persona.h
+@@ -0,0 +1,165 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The declared display panel, and the work area, colour depth and orientation derived from it.
++//
++// One home for the whole derivation, because five translation units need it: core/frame/screen.cc,
++// core/frame/local_dom_window.cc, core/css/media_values.cc,
++// modules/screen_details/screen_detailed.cc and
++// modules/screen_orientation/screen_orientation_controller.cc. Three copies of a work-area inset
++// table would be three answers to one question, which is the class of bug this patch set has spent
++// two stages removing.
++//
++// Every switch read is `switch > host`: a positive value wins, anything else falls through to the
++// real display. There is no persona rung -- see the patch header for why the counterpart's was
++// dropped.
++
++#ifndef COMPONENTS_UNGOOGLED_DISPLAY_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_DISPLAY_PERSONA_H_
++
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace display_persona {
++
++// The panel a profile declares, in DIPs -- the unit `screen.width` / `screen.height` report and the
++// unit `--window-size` takes. Physical pixels are the panel times the scale factor and are not
++// modelled here: no web-exposed surface reports them directly.
++struct Panel {
++  int width = 0;
++  int height = 0;
++};
++
++// The rectangle a window may occupy, in the declared panel's own coordinates.
++struct WorkArea {
++  int x = 0;
++  int y = 0;
++  int width = 0;
++  int height = 0;
++};
++
++// One reserved strip per claimed shell, in DIPs. These are statements about where an operating
++// system puts its shell -- the only kind of claim Veil's assertion 6 permits -- and each is bounded
++// well inside the 0-200 px that `screen-os-chrome-is-plausible` allows.
++//
++// Windows 11 reserves its taskbar at the bottom: 48 px at 100% scale, which is this build host's own
++// measured value (a 2560x1440 panel reports availHeight 1392). macOS reserves the menu bar at the
++// top and is modelled with the Dock auto-hidden, because the menu bar's height follows from the
++// platform while a Dock's does not -- it follows from settings Veil holds no field for. GNOME
++// reserves its top bar.
++constexpr int kWindowsTaskbarHeight = 48;
++constexpr int kMacOSMenuBarHeight = 25;
++constexpr int kLinuxTopPanelHeight = 27;
++
++// "If the user agent does not know the color depth or does not want to return it for privacy
++// considerations, it should return 24." -- https://drafts.csswg.org/cssom-view/#dom-screen-colordepth
++// Every desktop shell a persona would claim reports 24, and `screen.pixelDepth` is Blink's alias of
++// `colorDepth`, so one derived constant drives two surfaces.
++constexpr int kColorDepth = 24;
++
++// A positive integer switch value, or nothing. Zero and negatives are rejected rather than clamped:
++// a panel of 0 px is not a smaller panel, it is a malformed command line, and falling through to the
++// host is the honest answer to one.
++inline bool PositiveIntSwitch(const char* name, int* out) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  int value = 0;
++  if (command_line && command_line->HasSwitch(name) &&
++      base::StringToInt(command_line->GetSwitchValueASCII(name), &value) &&
++      value > 0) {
++    *out = value;
++    return true;
++  }
++  return false;
++}
++
++// Both dimensions or neither. A half-declared panel would put a spoofed width beside the host's
++// height, which is a machine narrower or taller than any that exists -- worse than not spoofing.
++inline bool DeclaredPanel(Panel* out) {
++  Panel panel;
++  if (!PositiveIntSwitch(::switches::kFingerprintScreenWidth, &panel.width) ||
++      !PositiveIntSwitch(::switches::kFingerprintScreenHeight, &panel.height)) {
++    return false;
++  }
++  *out = panel;
++  return true;
++}
++
++// The scale factor, parsed as a double so `1`, `1.5` and `2.00` all work. Veil pins the formatting
++// to two decimals so one profile always produces one byte-identical command line, but the engine
++// must not depend on that: a hand-run command line is a supported way to reproduce a capture.
++inline bool DeclaredScaleFactor(double* out) {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  double value = 0;
++  if (command_line &&
++      command_line->HasSwitch(::switches::kFingerprintDeviceScaleFactor) &&
++      base::StringToDouble(command_line->GetSwitchValueASCII(
++                               ::switches::kFingerprintDeviceScaleFactor),
++                           &value) &&
++      value > 0) {
++    *out = value;
++    return true;
++  }
++  return false;
++}
++
++// The platform the profile claims, lower-cased, or empty when it claims none. Same read as `002`,
++// `006` and `011` perform, and the empty case matters: Veil emits `--fingerprint-platform` only
++// alongside a seed, so the caller must have a defined answer for a panel with no claimed platform.
++inline std::string ClaimedPlatform() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line && command_line->HasSwitch(::switches::kFingerprintPlatform)) {
++    return base::ToLowerASCII(
++        command_line->GetSwitchValueASCII(::switches::kFingerprintPlatform));
++  }
++  return std::string();
++}
++
++// The panel minus the claimed shell's one reserved strip.
++//
++// An unclaimed platform falls to the Windows strip rather than to zero, and that is deliberate: this
++// engine is a Windows build, so a bare `--fingerprint-screen-width` with no platform claim is a
++// Windows machine, and a zero strip would report a work area exactly equal to the panel -- a kiosk,
++// which is a louder tell than a taskbar.
++inline WorkArea DeclaredWorkArea(const Panel& panel) {
++  const std::string platform = ClaimedPlatform();
++  int top = 0;
++  int bottom = 0;
++  if (platform == "macos") {
++    top = kMacOSMenuBarHeight;
++  } else if (platform == "linux") {
++    top = kLinuxTopPanelHeight;
++  } else {
++    bottom = kWindowsTaskbarHeight;
++  }
++  const int height = panel.height - top - bottom;
++  return WorkArea{0, top, panel.width, height > 1 ? height : 1};
++}
++
++// A window origin kept inside `[minimum, minimum + room]`, and returned untouched when it already
++// fits. Used for `window.screenX` / `window.screenY`: the position is a real measurement of a real
++// window, so it is only overridden where keeping it would put the window off an edge of a panel the
++// page has been told about.
++inline int ClampOrigin(int origin, int minimum, int room) {
++  const int limit = minimum + (room > 0 ? room : 0);
++  if (origin < minimum) {
++    return minimum;
++  }
++  return origin > limit ? limit : origin;
++}
++
++// Blink's own rule, from `ScreenOrientationController::ComputeOrientation` at rotation 0: a display
++// taller than it is wide is portrait. Squares are landscape, which is Blink's answer too.
++inline bool IsPortrait(const Panel& panel) {
++  return panel.height > panel.width;
++}
++
++}  // namespace display_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_DISPLAY_PERSONA_H_
+
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,6 +28,8 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include "components/ungoogled/display_persona.h"
++
+ #include "base/numerics/safe_conversions.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+@@ -81,12 +83,21 @@
+ int Screen::height() const {
+   if (!DomWindow())
+     return 0;
++  // 960: the declared panel, in DIPs, exactly as the switch carries it. `GetScreenInfo()` and every
++  // consumer of it -- the compositor, layout, the window -- are deliberately untouched: this moves
++  // what JS reports and nothing else.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return panel.height;
+   return GetRect(/*available=*/false).height();
+ }
+ 
+ int Screen::width() const {
+   if (!DomWindow())
+     return 0;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return panel.width;
+   return GetRect(/*available=*/false).width();
+ }
+ 
+@@ -100,6 +111,13 @@
+   if (!DomWindow()) {
+     return unknown_color_depth;
+   }
++  // 960: 24 on every desktop shell a persona would claim, and `pixelDepth()` below is Blink's alias
++  // of this getter, so one derived value covers both surfaces. Gated on the panel rather than on the
++  // scale factor: this is a property of the declared display, and a profile that declares no display
++  // keeps the host's depth.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return static_cast<unsigned>(ungoogled::display_persona::kColorDepth);
+   return GetScreenInfo().depth == 0
+              ? unknown_color_depth
+              : base::saturated_cast<unsigned>(GetScreenInfo().depth);
+@@ -112,24 +130,39 @@
+ int Screen::availLeft() const {
+   if (!DomWindow())
+     return 0;
++  // 960: the work area of the declared panel. Windows and GNOME put their shell across the full
++  // width, and macOS's Dock is modelled as auto-hidden, so the work area starts at x = 0 on all
++  // three; `availTop` carries whatever the shell reserves at the top.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return ungoogled::display_persona::DeclaredWorkArea(panel).x;
+   return GetRect(/*available=*/true).x();
+ }
+ 
+ int Screen::availTop() const {
+   if (!DomWindow())
+     return 0;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return ungoogled::display_persona::DeclaredWorkArea(panel).y;
+   return GetRect(/*available=*/true).y();
+ }
+ 
+ int Screen::availHeight() const {
+   if (!DomWindow())
+     return 0;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return ungoogled::display_persona::DeclaredWorkArea(panel).height;
+   return GetRect(/*available=*/true).height();
+ }
+ 
+ int Screen::availWidth() const {
+   if (!DomWindow())
+     return 0;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return ungoogled::display_persona::DeclaredWorkArea(panel).width;
+   return GetRect(/*available=*/true).width();
+ }
+ 
+@@ -151,6 +184,13 @@
+   if (!DomWindow()) {
+     return false;
+   }
++  // 960: a persona is one display. `true` would say the machine has a second monitor Veil cannot
++  // describe -- and on a real multi-monitor host it says so truthfully, which is worse: it is the
++  // host's property leaking through a spoofed panel. Placed before the permissions-policy check on
++  // purpose, so the answer does not depend on whether the page holds window-management permission.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return false;
+   auto* context = GetExecutionContext();
+   if (!context->IsFeatureEnabled(
+           network::mojom::PermissionsPolicyFeature::kWindowManagement)) {
+
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -31,6 +31,7 @@
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "components/ungoogled/display_persona.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/trace_event/trace_id_helper.h"
+@@ -1776,6 +1777,20 @@
+   }
+ 
+   ChromeClient& chrome_client = page->GetChromeClient();
++  // 960: the window position is real and stays real -- it is only clamped into the declared work
++  // area, because a window manager that placed a 1280-px window at x = 900 on this 2560-px host puts
++  // it off the right edge of a panel the page has been told is 1470 px wide. On a host that placed
++  // the window inside the declared area this returns the same number it would have returned anyway.
++  // clearcote fabricates `16 + seed % 160` here instead; Veil does not, because a made-up position
++  // is a second source for a fact the real window already answers.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel)) {
++    const ungoogled::display_persona::WorkArea work =
++        ungoogled::display_persona::DeclaredWorkArea(panel);
++    return ungoogled::display_persona::ClampOrigin(
++        chrome_client.RootWindowRect(*frame).x(), work.x,
++        work.width - outerWidth());
++  }
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+         lroundf(chrome_client.RootWindowRect(*frame).x() *
+@@ -1796,6 +1811,16 @@
+   }
+ 
+   ChromeClient& chrome_client = page->GetChromeClient();
++  // 960: as `screenX`, on the other axis. The lower bound is the work area's top, so a macOS persona
++  // cannot report a window sitting on top of its own menu bar.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel)) {
++    const ungoogled::display_persona::WorkArea work =
++        ungoogled::display_persona::DeclaredWorkArea(panel);
++    return ungoogled::display_persona::ClampOrigin(
++        chrome_client.RootWindowRect(*frame).y(), work.y,
++        work.height - outerHeight());
++  }
+   if (page->GetSettings().GetReportScreenSizeInPhysicalPixelsQuirk()) {
+     return static_cast<int>(
+         lroundf(chrome_client.RootWindowRect(*frame).y() *
+@@ -1911,6 +1936,14 @@
+     return 0.0;
+   }
+ 
++  // 960: the declared scale factor. `LocalFrame::DevicePixelRatio()` is left alone, which is the
++  // whole difference between this patch and the stock `--force-device-scale-factor`: that switch
++  // moves the *real* factor, so the compositor, the layout viewport and the window all move with it
++  // while `screen.width` stays the host's. Here the reported number moves and the surface does not.
++  double scale_factor = 0;
++  if (ungoogled::display_persona::DeclaredScaleFactor(&scale_factor))
++    return scale_factor;
++
+   return GetFrame()->DevicePixelRatio();
+ }
+ 
+
+diff --git a/third_party/blink/renderer/modules/screen_details/screen_detailed.cc b/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
+--- a/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
++++ b/third_party/blink/renderer/modules/screen_details/screen_detailed.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <cmath>
+ 
++#include "components/ungoogled/display_persona.h"
++
+ #include "base/numerics/safe_conversions.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -104,36 +106,65 @@
+ int ScreenDetailed::left() const {
+   if (!DomWindow())
+     return 0;
++  // 960: `ScreenDetailed` inherits `width`, `height`, `avail*`, `colorDepth` and `isExtended` from
++  // `Screen`, so those are already the declared panel's by the time a page gets here. What is left is
++  // this class's own six getters, and five of them follow from "one display" with no new information:
++  // the only screen sits at the multi-screen origin, it is the primary one, and its scale factor is
++  // the one `window.devicePixelRatio` reports.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return 0;
+   return GetRect(/*available=*/false).x();
+ }
+ 
+ int ScreenDetailed::top() const {
+   if (!DomWindow())
+     return 0;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return 0;
+   return GetRect(/*available=*/false).y();
+ }
+ 
+ bool ScreenDetailed::isPrimary() const {
+   if (!DomWindow())
+     return false;
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return true;
+   return GetScreenInfo().is_primary;
+ }
+ 
+ bool ScreenDetailed::isInternal() const {
+   if (!DomWindow())
+     return false;
++  // The sixth is deliberately not answered. `isInternal` distinguishes a laptop panel from an
++  // external monitor, Veil models no such distinction, and clearcote derives it from `persona.mobile`
++  // -- a field that does not exist here. A guess would be a value that agrees with nothing else in
++  // the snapshot, which is worse than the host's truth. Recorded as a gap in 6.11 rather than filled.
+   return GetScreenInfo().is_internal;
+ }
+ 
+ float ScreenDetailed::devicePixelRatio() const {
+   if (!DomWindow())
+     return 0.f;
++  double scale_factor = 0;
++  if (ungoogled::display_persona::DeclaredScaleFactor(&scale_factor))
++    return static_cast<float>(scale_factor);
+   return GetScreenInfo().device_scale_factor;
+ }
+ 
+ String ScreenDetailed::label() const {
+   if (!DomWindow())
+     return String();
++  // Empty rather than derived. The host's label is its monitor's model name -- "Generic PnP Monitor",
++  // "DELL U2412M" -- which is hardware identification of the machine Veil is hiding, and Chrome
++  // itself returns an empty label to a page without window-management consent. An empty label under
++  // consent is a small tell; a real monitor model is a large one, and CLAUDE.md's priority order
++  // picks between them.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return String();
+   return String::FromUtf8(GetScreenInfo().label);
+ }
+ 
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
++#include "components/ungoogled/display_persona.h"
++
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+ #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
+@@ -164,6 +166,12 @@
+ 
+ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++  // 960: `(device-width:)` and `screen.width` are two code paths for one fact, and the probe now asks
++  // both (`misc.mediaQueryAgreement`, probe v6). Spoofing `Screen` and leaving `MediaValues` is the
++  // half-finished shape that reads as a contradiction in one line of CSS.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return panel.width;
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_width = screen_info.rect.width();
+@@ -176,6 +184,9 @@
+ 
+ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return panel.height;
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_height = screen_info.rect.height();
+@@ -193,6 +204,12 @@
+ }
+ 
+ float MediaValues::CalculateDevicePixelRatio(LocalFrame* frame) {
++  // 960: this is the whole `(resolution:)` / `(min-resolution:)` / `-webkit-device-pixel-ratio`
++  // family, and `srcset` picks its candidate from the same number, so one read keeps CSS, images and
++  // `window.devicePixelRatio` on one answer.
++  double scale_factor = 0;
++  if (ungoogled::display_persona::DeclaredScaleFactor(&scale_factor))
++    return static_cast<float>(scale_factor);
+   return frame->DevicePixelRatio();
+ }
+ 
+@@ -208,6 +225,13 @@
+ int MediaValues::CalculateColorBitsPerComponent(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetPage());
++  // 960: `(color: n)` is bits *per component*, so it is `screen.colorDepth / 3` and cannot be given
++  // its own switch without letting the two disagree. 24 / 3 = 8, which is what this host reports
++  // anyway -- the value is here for a host that reports 10 (a 30-bit HDR panel), where leaving it
++  // would put `(color: 10)` beside `screen.colorDepth === 24`.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return ungoogled::display_persona::kColorDepth / 3;
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   if (screen_info.is_monochrome) {
+@@ -219,6 +243,12 @@
+ int MediaValues::CalculateMonochromeBitsPerComponent(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetPage());
++  // A persona's display is a colour display, which is what `(monochrome: 0)` says. Zero is also what
++  // a colour host reports, so this changes nothing here and closes `(monochrome:)` on a host where a
++  // greyscale panel would otherwise contradict `(color: 8)`.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel))
++    return 0;
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   if (!screen_info.is_monochrome) {
+
+diff --git a/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc b/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
+--- a/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
++++ b/third_party/blink/renderer/modules/screen_orientation/screen_orientation_controller.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <utility>
++#include "components/ungoogled/display_persona.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+@@ -110,6 +111,24 @@
+ void ScreenOrientationController::UpdateOrientation() {
+   DCHECK(orientation_);
+   DCHECK(GetPage());
++  // 960: derived from the declared panel's own aspect, using Blink's rule for rotation 0 in
++  // `ComputeOrientation` below -- taller than wide is portrait. The angle is 0 because a persona is a
++  // fixed desktop panel: a rotated monitor is a real configuration, but it needs its own field before
++  // it can be claimed, and inventing one here would report a rotation nothing else in the profile
++  // knows about.
++  //
++  // The host's `screen_info.orientation_type` is bypassed rather than corrected. On Windows the
++  // embedder fills it in, so `ComputeOrientation` is never reached and patching that function alone
++  // would have moved nothing -- which is why this hunk is here and not there.
++  ungoogled::display_persona::Panel panel;
++  if (ungoogled::display_persona::DeclaredPanel(&panel)) {
++    orientation_->SetType(
++        ungoogled::display_persona::IsPortrait(panel)
++            ? display::mojom::blink::ScreenOrientation::kPortraitPrimary
++            : display::mojom::blink::ScreenOrientation::kLandscapePrimary);
++    orientation_->SetAngle(0);
++    return;
++  }
+   ChromeClient& chrome_client = GetPage()->GetChromeClient();
+   LocalFrame& frame = *DomWindow()->GetFrame();
+   const display::ScreenInfo& screen_info = chrome_client.GetScreenInfo(frame);
