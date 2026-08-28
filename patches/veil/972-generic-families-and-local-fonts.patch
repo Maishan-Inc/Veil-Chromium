@@ -1,0 +1,390 @@
+# Origin:  none -- Veil-authored. T01 found no counterpart for this surface in
+#          clearcotelabs/clearcote-browser (Veil/docs/MIGRATION-UNGOOGLED.md 6.5 lists `972` among the
+#          eight with none), and its `040-fonts` does not touch generic resolution or
+#          `queryLocalFonts()` at all.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# TWO holes in the font surface, both left open by `006` + `906` and both handed here with a
+# measurement (6.8):
+#
+# 1. **The generics collapse.** Measured on the shipping engine under the `persona` case: `monospace`
+#    and `serif` both report 1009x80 -- a machine whose fixed-width font is Times New Roman, which is a
+#    defect on every `<pre>` a page renders as well as a tell. The cause is not a bug in `906` but its
+#    scope, and it is narrower than 6.8 predicted: `--lang=en-US` moves Chrome's own font preferences to
+#    the English set, so the host's families are already `Times New Roman`, `Arial` and `Consolas` --
+#    and `Consolas` is a ClearType face no macOS table lists, so `906` hides it and `monospace` falls
+#    through to the standard family. (The localised names 6.8 describes hide all three the same way on a
+#    host whose UI locale is not English, which is the `default` case rather than a persona.) `906`'s own
+#    comment names `FontSelector` as the fix, which is what this patch does: on a cross-platform claim the four
+#    generics `font_persona.h` speaks for resolve to the faces the *claimed* platform's Chrome defaults
+#    to. The table is Chromium's own, from `chrome/app/resources/locale_settings_mac.grd` and
+#    `locale_settings_linux.grd`, with one deviation (`Courier` for `Menlo`) and three abstentions
+#    (`cursive`, `fantasy`, `math`), each argued in that header.
+#
+#    What the page can observe is metrics, never the resolved family name, so the goal is not "the
+#    exact widths of a Mac's Times" -- impossible on a host without the face, and unchanged as `906`'s
+#    residual -- but that the generics *differ from each other* and that `monospace` is monospaced.
+#    `Times` and `Helvetica` reach real host faces through Blink's own aliasing (`Times New Roman`,
+#    `Arial`), which is why they were chosen over any other pair the claimed table lists.
+#
+# 2. **`queryLocalFonts()` routes around the whole block.** It reads a table the *browser* process
+#    built from the real operating system, so it answers "which fonts does this machine have" with the
+#    host's set while every CSS lookup answers with the claimed platform's -- and a page can ask both
+#    in one function. Filtered here by the same membership rule `006`/`906` apply, from the same tables:
+#    `veil_font_claim.h` declares the predicate and `font_cache.cc` defines it, because that is where
+#    the three 541-name tables already are. Filtered rather than removed: the function is already
+#    visible on this engine (`queryLocalFontsAvailable: true` in every capture), and deleting a
+#    function a page can see is a larger claim than answering it consistently.
+#
+# `queryLocalFonts()` needs a user gesture, page visibility and the `local-fonts` permission, so the
+# committed probe cannot call it -- it records availability only, deliberately, because a capture that
+# prompts hangs. The measurement for this half is therefore taken outside the harness, with CDP
+# granting the permission and evaluating under a user gesture, and it is written into 6.16.
+#
+# No switch is added. Both halves follow `--fingerprint` and `--fingerprint-platform`, and
+# `--disable-spoofing=font` opts both out -- the same key `006` and `906` already answer to, because
+# this is the same surface.
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -7,6 +7,7 @@
+     "audio_persona.h",
+     "display_persona.h",
+     "fingerprint_data.h",
++    "font_persona.h",
+     "media_persona.h",
+     "platform_claim.h",
+     "ungoogled_switches.h",
+
+diff --git a/components/ungoogled/font_persona.h b/components/ungoogled/font_persona.h
+new file mode 100644
+index 0000000000..d5aa30571f
+--- /dev/null
++++ b/components/ungoogled/font_persona.h
+@@ -0,0 +1,111 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Which face the claimed platform's Chrome resolves each CSS generic to.
++//
++// `serif`, `sans-serif` and `monospace` are not names a page reads back -- `getComputedStyle` returns
++// the keyword, never the resolved family -- so what is observable here is *metrics*: the width and
++// height of a string set in each generic. That makes two things worth having and one thing impossible:
++//
++//   worth having   -- the three generics must not collapse onto one face. Measured on the shipping
++//                     engine under the `persona` case: `monospace` and `serif` both report 1009x80,
++//                     i.e. a machine whose fixed-width font is Times New Roman. The cause is narrower
++//                     than 6.8 predicted and was measured rather than assumed: `--lang=en-US` moves
++//                     Chrome's own font preferences to the English set, so the host's families are
++//                     already `Times New Roman`, `Arial` and **`Consolas`** -- and `Consolas` is a
++//                     ClearType face no macOS table lists, so `906` hides it and the generic falls
++//                     through to the standard family. (On a host whose UI locale is not English the
++//                     localised names 6.8 describes -- "宋体", "微软雅黑" -- hide all three the same
++//                     way, which is the `default` case rather than a persona.)
++//   worth having   -- `monospace` must be monospaced. A proportional face behind that keyword is both
++//                     a tell and a visible defect on every `<pre>` on the page.
++//   impossible     -- the exact metrics of a Mac's Times or Helvetica, on a host that has neither.
++//                     That is `906`'s advance-width residual, and it is unchanged by this patch.
++//
++// THE TABLE IS CHROMIUM'S OWN, per platform: `chrome/app/resources/locale_settings_mac.grd` and
++// `locale_settings_linux.grd` are where Chrome's default generic families are declared, so "what does
++// a Mac's Chrome resolve `serif` to" is answered by the source rather than by a guess --
++// `IDS_SERIF_FONT_FAMILY` is `Times` on macOS, `Times New Roman` on Linux and Windows,
++// `IDS_SANS_SERIF_FONT_FAMILY` is `Helvetica` / `Arial`, `IDS_FIXED_FONT_FAMILY` is `Menlo` /
++// `Monospace` / `Courier New`.
++//
++// ONE DELIBERATE DEVIATION FROM THAT TABLE, and it is the monospace row. The grd says `Menlo`, which
++// this host does not have and cannot alias, so `906`'s cross-platform branch would substitute a
++// host face chosen by a seed hash -- possibly a proportional one, for the keyword whose whole meaning
++// is that it is not. `Courier` is sent instead: a family macOS genuinely ships, and one Blink aliases
++// to `Courier New` on Windows (`AlternateFamilyName()`), so the generic keeps its *class* on this host
++// while still naming a face the claimed platform has. The name is not observable; the class is.
++//
++// THREE ROWS DELIBERATELY LEFT ALONE:
++//
++// - `cursive` and `fantasy`. This host resolves them to `Comic Sans MS` and `Impact`, which are
++//   Microsoft's cross-platform Office faces and are in `006`'s macOS table for exactly that reason, so
++//   the values a Mac persona already reports are families a Mac with Office has -- and they measure
++//   distinct (975x90 and 1145x95). Replacing them with `Apple Chancery` and `Papyrus` would trade two
++//   plausible resolved faces for two seed-chosen substitutes.
++// - `math`. `STIX Two Math` has no host face and no alias, so the substitution would change one
++//   fallback for another.
++// - Every **script-specific** row. `FamilyNameFromSettings` is script-aware, and the grd carries
++//   Japanese, Korean, Han and Devanagari rows -- but for a cross-platform claim both sides of that
++//   choice end up at the same place on this host: the claimed CJK face (`PingFang SC`,
++//   `Hiragino Kaku Gothic ProN`) is absent here, and the host's own (`宋体`, `Yu Gothic`) is hidden by
++//   `906`. Nothing observable changes, so nothing is claimed. A macOS *host* would need them.
++
++#ifndef COMPONENTS_UNGOOGLED_FONT_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_FONT_PERSONA_H_
++
++#include <string>
++
++#include "components/ungoogled/platform_claim.h"
++
++namespace ungoogled {
++namespace font_persona {
++
++// The CSS generics this header speaks for. `kStandard` covers `-webkit-standard` and the default
++// font, which Blink resolves through the same settings call.
++enum class Generic { kStandard, kSerif, kSansSerif, kFixed };
++
++// The family Chrome on the claimed platform defaults to for `generic`, or empty to leave the host's
++// setting in place -- which is the answer for a same-platform claim, a missing seed,
++// `--disable-spoofing=font`, and for every generic not in the enum above.
++inline std::string ClaimedGenericFamily(Generic generic) {
++  if (!platform_claim::ShouldPresentOtherPlatform("font")) {
++    return std::string();
++  }
++  const std::string claimed = platform_claim::Claimed();
++  if (claimed == "macos") {
++    switch (generic) {
++      case Generic::kStandard:
++      case Generic::kSerif:
++        return "Times";
++      case Generic::kSansSerif:
++        return "Helvetica";
++      case Generic::kFixed:
++        // The grd says `Menlo`; see the header comment for why this is `Courier`.
++        return "Courier";
++    }
++    return std::string();
++  }
++  if (claimed == "linux") {
++    switch (generic) {
++      case Generic::kStandard:
++      case Generic::kSerif:
++        return "Times New Roman";
++      case Generic::kSansSerif:
++        return "Arial";
++      case Generic::kFixed:
++        // `locale_settings_linux.grd` says `Monospace`, which is fontconfig's alias rather than a
++        // face; on a non-Linux host it resolves to nothing. `DejaVu Sans Mono` is the face fontconfig
++        // points that alias at on every mainstream distribution, and it is in `006`'s Linux table.
++        return "DejaVu Sans Mono";
++    }
++    return std::string();
++  }
++  return std::string();
++}
++
++}  // namespace font_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_FONT_PERSONA_H_
+
+diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
+--- a/third_party/blink/renderer/platform/BUILD.gn
++++ b/third_party/blink/renderer/platform/BUILD.gn
+@@ -703,6 +703,7 @@
+     "fonts/font_unique_name_lookup.h",
+     "fonts/font_variant_alternates.cc",
+     "fonts/font_variant_alternates.h",
++    "fonts/veil_font_claim.h",
+     "fonts/font_variant_east_asian.cc",
+     "fonts/font_variant_east_asian.h",
+     "fonts/font_variant_emoji.cc",
+
+diff --git a/third_party/blink/renderer/platform/fonts/veil_font_claim.h b/third_party/blink/renderer/platform/fonts/veil_font_claim.h
+new file mode 100644
+index 0000000000..f6b9dfd368
+--- /dev/null
++++ b/third_party/blink/renderer/platform/fonts/veil_font_claim.h
+@@ -0,0 +1,38 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Does the claimed platform present this family? One declaration, so that a second consumer of
++// `006`'s membership rule does not need a second copy of `006`'s tables.
++//
++// `queryLocalFonts()` is that second consumer, and it is the hole `972` closes: the enumerable set a
++// page measures through CSS goes through `FontCache::GetFontPlatformData`, where `006` and `906`
++// answer for the claimed platform, while `queryLocalFonts()` reads a table the browser process built
++// from the real operating system and routes around them entirely. Two answers to "which fonts does
++// this machine have", and the second one is the host's.
++//
++// The definition lives in `font_cache.cc` because that is where the three platform tables are -- 541
++// family names per platform, materialised once -- and moving them would mean editing a ported patch's
++// data rather than adding to it.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_FONTS_VEIL_FONT_CLAIM_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_FONTS_VEIL_FONT_CLAIM_H_
++
++#include <string>
++
++#include "third_party/blink/renderer/platform/platform_export.h"
++
++namespace blink {
++
++// True when `family` is a name the claimed platform's font list presents, by exactly the rule `006`
++// and `906` apply in `FontCache`: on a cross-platform claim, membership of the claimed platform's
++// table; on a same-platform claim, everything except a face that belongs to a *different* platform's
++// table. Always true when no seed is present or `--disable-spoofing=font` is set.
++//
++// `std::string` rather than `WTF::String` on purpose: the one caller has the name as a `std::string`
++// out of a protobuf, and the tables it is compared against are `std::string` too.
++PLATFORM_EXPORT bool VeilClaimedPlatformPresentsFamily(const std::string& family);
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_FONTS_VEIL_FONT_CLAIM_H_
+
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -46,6 +46,7 @@
+ #include "base/timer/elapsed_timer.h"
+ #include "base/trace_event/process_memory_dump.h"
+ #include "base/trace_event/trace_event.h"
++#include "components/ungoogled/platform_claim.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "build/build_config.h"
+ #include "skia/ext/font_utils.h"
+@@ -64,6 +65,7 @@
+ #include "third_party/blink/renderer/platform/fonts/font_platform_data_cache.h"
+ #include "third_party/blink/renderer/platform/fonts/font_unique_name_lookup.h"
+ #include "third_party/blink/renderer/platform/fonts/simple_font_data.h"
++#include "third_party/blink/renderer/platform/fonts/veil_font_claim.h"
+ #include "third_party/blink/renderer/platform/heap/thread_state.h"
+ #include "third_party/blink/renderer/platform/instrumentation/tracing/web_memory_allocator_dump.h"
+ #include "third_party/blink/renderer/platform/instrumentation/tracing/web_process_memory_dump.h"
+@@ -296,6 +298,31 @@
+   return false;
+ }
+ 
++// Veil 972: the same membership decision, for the one other API that enumerates families.
++//
++// `queryLocalFonts()` reads a table the browser process built from the real operating system, so
++// without this it answers "which fonts does this machine have" with the host's set while CSS answers
++// with the claimed platform's -- and a page can ask both in the same function. Declared in
++// veil_font_claim.h; defined here because the three tables are here.
++//
++// Both branches mirror GetFontPlatformData below rather than restating a rule: cross-platform, a family
++// is presented iff the claimed platform's table lists it; same-platform, everything is presented except
++// a face that belongs to another platform's table, which is the one contradiction the host's own list
++// can carry. There is no substitution rung, because a name is all this API returns.
++bool VeilClaimedPlatformPresentsFamily(const std::string& font_family) {
++  if (!ungoogled::platform_claim::SeedPresent() ||
++      ungoogled::platform_claim::SpoofingDisabled("font")) {
++    return true;
++  }
++  const std::string claimed = ungoogled::platform_claim::Claimed();
++  const std::string host = ungoogled::platform_claim::Host();
++  if (claimed != host) {
++    return VeilPlatformPresentsFamily(GetPlatformFonts(claimed), font_family);
++  }
++  return VeilPlatformPresentsFamily(GetPlatformFonts(host), font_family) ||
++         !VeilFamilyBelongsToAnotherPlatform(claimed, font_family);
++}
++
+ 
+ const FontPlatformData* FontCache::GetFontPlatformData(
+     const FontDescription& font_description,
+
+diff --git a/third_party/blink/renderer/platform/fonts/font_selector.cc b/third_party/blink/renderer/platform/fonts/font_selector.cc
+--- a/third_party/blink/renderer/platform/fonts/font_selector.cc
++++ b/third_party/blink/renderer/platform/fonts/font_selector.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/platform/fonts/font_selector.h"
+ 
+ #include "build/build_config.h"
++#include "components/ungoogled/font_persona.h"
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/platform/fonts/alternate_font_family.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+@@ -17,6 +18,35 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++// Veil 972: the face the claimed platform's Chrome resolves this generic to, or empty to leave the
++// host's Settings value in place. The order of the tests below mirrors the desktop branch of
++// FamilyNameFromSettings exactly -- standard and -webkit-standard first, then the keywords -- so the
++// substitution happens for the same requests the settings lookup would have answered, and for no
++// others.
++std::string VeilClaimedGenericFamily(const FontDescription& font_description,
++                                     const AtomicString& generic_family_name) {
++  using Generic = ungoogled::font_persona::Generic;
++  if (font_description.GenericFamily() == FontDescription::kStandardFamily ||
++      font_description.GenericFamily() == FontDescription::kWebkitBodyFamily ||
++      generic_family_name == font_family_names::kWebkitStandard) {
++    return ungoogled::font_persona::ClaimedGenericFamily(Generic::kStandard);
++  }
++  if (generic_family_name == font_family_names::kSerif) {
++    return ungoogled::font_persona::ClaimedGenericFamily(Generic::kSerif);
++  }
++  if (generic_family_name == font_family_names::kSansSerif) {
++    return ungoogled::font_persona::ClaimedGenericFamily(Generic::kSansSerif);
++  }
++  if (generic_family_name == font_family_names::kMonospace) {
++    return ungoogled::font_persona::ClaimedGenericFamily(Generic::kFixed);
++  }
++  return std::string();
++}
++
++}  // namespace
++
+ AtomicString FontSelector::FamilyNameFromSettings(
+     const GenericFontFamilySettings& settings,
+     const FontDescription& font_description,
+@@ -70,6 +100,20 @@
+   }
+ #else   // BUILDFLAG(IS_ANDROID)
+   UScriptCode script = font_description.GetScript();
++  // Veil 972: a cross-platform persona resolves the generics to the faces the claimed platform's own
++  // Chrome defaults to, instead of to this host's Settings. Measured before this patch: on a macOS
++  // persona `monospace` and `serif` both reported 1009x80 -- a machine whose fixed-width font is Times
++  // New Roman -- because `--lang=en-US` leaves the host's fixed family as `Consolas`, which no macOS
++  // table lists, so `906` hides it and the generic falls through to the standard face (6.16).
++  //
++  // Only the four generics `font_persona.h` speaks for are substituted, and only for the default
++  // script; `cursive`, `fantasy`, `math` and every script-specific row fall through to the settings
++  // below, each for a reason written down in that header.
++  const std::string veil_family =
++      VeilClaimedGenericFamily(font_description, generic_family_name);
++  if (!veil_family.empty()) {
++    return AtomicString(veil_family.c_str());
++  }
+   if (font_description.GenericFamily() == FontDescription::kStandardFamily ||
+       font_description.GenericFamily() == FontDescription::kWebkitBodyFamily)
+     return settings.Standard(script);
+
+diff --git a/third_party/blink/renderer/modules/font_access/font_access.cc b/third_party/blink/renderer/modules/font_access/font_access.cc
+--- a/third_party/blink/renderer/modules/font_access/font_access.cc
++++ b/third_party/blink/renderer/modules/font_access/font_access.cc
+@@ -22,6 +22,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/modules/font_access/font_metadata.h"
+ #include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/fonts/veil_font_claim.h"
+ 
+ namespace blink {
+ 
+@@ -161,6 +162,20 @@
+       continue;
+     }
+ 
++    // Veil 972: this table was built by the browser process from the real operating system, so
++    // without this filter `queryLocalFonts()` answers "which fonts does this machine have" with the
++    // host's set while every CSS lookup answers with the claimed platform's -- two answers a page can
++    // ask for in one function. Filtered by the same membership rule `006` and `906` apply, from the
++    // same tables (`veil_font_claim.h`), so the enumerated set is the set the measurement-based
++    // enumeration already reports.
++    //
++    // Filtered rather than refused: `window.queryLocalFonts` is already visible on this engine
++    // (`queryLocalFontsAvailable: true` in every capture), and removing a function a page can see is a
++    // larger claim than answering it consistently.
++    if (!VeilClaimedPlatformPresentsFamily(element.family())) {
++      continue;
++    }
++
+     auto entry = FontEnumerationEntry{
+         .postscript_name = String::FromUtf8(element.postscript_name()),
+         .full_name = String::FromUtf8(element.full_name()),

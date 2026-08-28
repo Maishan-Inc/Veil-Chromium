@@ -33,7 +33,6 @@ veil/915-canvas-measure-text-multiplier-and-worker.patch
 veil/013-canvas-toDataURL.patch
 veil/006-font-fingerprint.patch
 veil/906-font-fingerprint-one-os-and-deterministic-absence.patch
-veil/014-client-rects.patch
 veil/002-user-agent-fingerprint.patch
 veil/011-gpu-info.patch
 veil/016-webgl-readPixels.patch
@@ -41,3 +40,7 @@ veil/001-disable-runtime-enable.patch
 veil/902-chromium-version-from-the-build.patch
 veil/960-display-panel.patch
 veil/963-webgl-capability-profile.patch
+veil/967-audio-device-persona.patch
+veil/968-speech-voice-persona.patch
+veil/969-media-devices-and-codec-persona.patch
+veil/972-generic-families-and-local-fonts.patch

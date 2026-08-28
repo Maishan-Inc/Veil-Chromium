@@ -1,0 +1,318 @@
+# Origin:  none -- Veil-authored. clearcotelabs/clearcote-browser's `170-speech-voices` was audited
+#          as the counterpart (Veil/docs/MIGRATION-UNGOOGLED.md 6.5) and is NOT the source of this
+#          patch: its roster is read from `ungoogled::CurrentPersona().voices` -- the second identity
+#          source 6.9 rejected -- and its table is Windows SAPI, which is the one platform this
+#          engine must not claim, being a Windows build. What transferred is the *set of call sites*
+#          and two arguments, both credited as arguments rather than as code: substitute in the one
+#          function both emission paths share, and never fill the list synchronously.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# `speechSynthesis.getVoices()` is a catalogue the operating system installs, so it names the platform
+# and the locale in one read. Measured on the shipping engine's `persona` capture: three
+# `Microsoft Huihui / Kangkang / Yaoyao - Chinese (Simplified, PRC)` voices, every one of them
+# `zh-CN`, on a machine that claims `en-US` and an Apple M3. Two of assertion 6's rules score exactly
+# that -- `voice-catalogue-belongs-to-the-claimed-os` and `voice-catalogue-covers-the-claimed-locale`
+# -- and they were the last two floors left on the `persona` case after T05/T06 (6.11).
+#
+# THE SHAPE IS TRANSCRIBED, THE ROSTER IS A CLAIM, and they are separated on purpose.
+# `content/browser/speech/tts_mac.mm:110-188` is a macOS Chrome's own list-building code, in this
+# tree: every voice from `AVSpeechSynthesisVoice.speechVoices`, sorted by name ascending, with the
+# system default moved to index 0, `lang` a BCP-47 tag, `native` true throughout. The mojo layer
+# copies `name` into `voiceURI` too and marks index 0 default
+# (`content/browser/speech/speech_synthesis_impl.cc:107`). All of that is reproduced rather than
+# approximated. The roster -- Apple's single-name compact voices, one per language -- is the part Veil
+# cannot verify without a Mac, and the table says so: the modern multi-language novelty voices (Eddy,
+# Flo, Grandma, Grandpa, Reed, Rocko, Sandy, Shelley), whose duplicate names are the reason
+# `tts_mac.mm` disambiguates at all, are deliberately not claimed. The error direction is a true set
+# smaller than a maximal Mac's rather than an invented name, and the borrowed Mac T08 waits for
+# settles it.
+#
+# ONE EMISSION PATH, NOT TWO. The counterpart patches the browser process *and* adds a renderer-side
+# backfill in `blink::SpeechSynthesis`. This patch does the browser half only, and the omission is the
+# argument rather than laziness:
+#
+# - Measured on this host: the browser path answers. Stock Chrome 151 reports 22 voices (3 local SAPI
+#   plus 19 `Google ...` network voices) and this engine reports the 3 local ones -- ungoogled having
+#   removed the Google TTS component -- so `OnSetVoiceList` arrives in both.
+# - A renderer implementation of the same table would be a second source of one fact, which is the
+#   rule 6.9 settled when it dropped the persona struct.
+# - The renderer half's own stated purpose is the case where the browser never replies, and in that
+#   case stock Chrome reports `[]` -- so does this engine, unchanged.
+#
+# And nothing is filled *synchronously*. `firstSyncCount: 0` measured on stock Chrome and on this
+# engine: the first `getVoices()` on a fresh document returns `[]` and the list arrives with a
+# `voiceschanged` event. A complete answer on the first call is an ordering tell independent of the
+# values, and anti-bot vendors read it directly.
+#
+# A LINUX CLAIM REPORTS NO VOICES. `content/browser/speech/tts_linux.cc` enumerates through
+# speech-dispatcher, which a desktop install frequently does not run, so an empty catalogue is an
+# ordinary Linux reading. It is also the only honest one available: Veil has no Linux roster it can
+# defend, and falling through would put Windows SAPI voices on a machine claiming Linux -- the same
+# contradiction this patch removes, pointing the other way. `true` with an empty list is therefore a
+# real answer in `ClaimedVoiceCatalogue`, not a failure to produce one.
+#
+# No switch is added, and no `--disable-spoofing` key either. The behaviour follows `--fingerprint`,
+# `--fingerprint-platform` and the locale switches, all of which exist; a new opt-out key would be a
+# value no Veil field can emit, which is the same lie as a switch no Chromium has. The flag dialect
+# does not grow and none of the three mirrors moves except `coherence.mjs`, which gains `voices` in
+# `DRIVEN_SURFACES` so its two rules score as defects from here on.
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -10,6 +10,7 @@
+     "platform_claim.h",
+     "ungoogled_switches.h",
+     "ungoogled_switches.cc",
++    "voice_persona.h",
+   ]
+ 
+   defines = [ "IS_UNGOOGLED_IMPL" ]
+
+diff --git a/components/ungoogled/voice_persona.h b/components/ungoogled/voice_persona.h
+new file mode 100644
+index 0000000000..9ec8a91943
+--- /dev/null
++++ b/components/ungoogled/voice_persona.h
+@@ -0,0 +1,180 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The speech-synthesis catalogue the claimed platform would report.
++//
++// `speechSynthesis.getVoices()` is installed by the operating system and by its language packs, so it
++// gives away the platform *and* the locale in a single read. Measured on the shipping engine: three
++// `Microsoft ... (zh-CN)` voices on a persona that claims an `en-US` Apple M3 -- Windows voices, for a
++// language the persona does not claim, on a machine that claims not to be Windows.
++//
++// TWO halves, and only one of them is a claim about hardware Veil cannot see:
++//
++// 1. The *shape* is transcribed from this tree, exactly as `963` transcribes ANGLE. A macOS Chrome
++//    builds its list in `content/browser/speech/tts_mac.mm:110-188`: every voice from
++//    `AVSpeechSynthesisVoice.speechVoices`, sorted by name ascending, with the system default voice
++//    moved to index 0; `lang` is a BCP-47 tag; `native` is true for all of them. The mojo layer then
++//    copies `name` into `voiceURI` as well (`content/browser/speech/speech_synthesis_impl.cc:107`)
++//    and marks index 0 as the default, which is why the order below is the observable order and why
++//    the default is a position rather than a flag.
++//
++// 2. The *roster* is a claim, and it is deliberately the smaller one. These are Apple's long-standing
++//    single-name compact voices, one per language, the set that has been on every macOS for a decade.
++//    The modern multi-language novelty voices -- Eddy, Flo, Grandma, Grandpa, Reed, Rocko, Sandy,
++//    Shelley, each shipped in several languages, which is the reason `tts_mac.mm` disambiguates
++//    duplicate names at all -- are **not** claimed here, because their presence depends on the macOS
++//    version and on what the user downloaded. The direction of that error is a true set that is
++//    smaller than a maximal Mac's, never an invented name; a borrowed Mac settles it, and it is the
++//    same host T08 is waiting for.
++//
++// Every name below is unique, which is also why no localised-language suffix is needed: the
++// disambiguation branch in `tts_mac.mm` only fires for a repeated name, so a table with none of them
++// reproduces the same output without depending on an ICU display name for a locale the host may not
++// have. The table is stored **pre-sorted by name**, so a reader sees the order the page will see.
++//
++// A Linux claim reports **no voices at all**. Chrome on Linux enumerates through speech-dispatcher
++// (`content/browser/speech/tts_linux.cc`), which a desktop install frequently does not run, so an
++// empty catalogue is an ordinary Linux reading -- and it is the honest one for Veil, which has no
++// Linux voice roster it can defend. Falling through to the host's Windows SAPI voices would be the
++// contradiction this patch exists to remove, pointing the other way.
++
++#ifndef COMPONENTS_UNGOOGLED_VOICE_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_VOICE_PERSONA_H_
++
++#include <cstddef>
++#include <iterator>
++#include <string>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
++#include "components/ungoogled/platform_claim.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace voice_persona {
++
++// One entry of a claimed catalogue. `name` doubles as `voiceURI`, which is what the mojo layer does
++// with a real one.
++struct Voice {
++  std::string name;
++  std::string lang;
++};
++
++struct VoiceRow {
++  const char* name;
++  const char* lang;
++};
++
++// Apple's compact voices, one per language, sorted by name. "Am\xC3\xA9lie" is written as explicit
++// UTF-8 bytes rather than as a literal so the encoding of this file cannot change what the page
++// reads.
++inline constexpr VoiceRow kMacOSVoices[] = {
++    {"Alice", "it-IT"},        {"Alva", "sv-SE"},      {"Am\xC3\xA9lie", "fr-CA"},
++    {"Anna", "de-DE"},         {"Carmit", "he-IL"},    {"Damayanti", "id-ID"},
++    {"Daniel", "en-GB"},       {"Ellen", "nl-BE"},     {"Ioana", "ro-RO"},
++    {"Joana", "pt-PT"},        {"Kanya", "th-TH"},     {"Karen", "en-AU"},
++    {"Kyoko", "ja-JP"},        {"Laura", "sk-SK"},     {"Lekha", "hi-IN"},
++    {"Luciana", "pt-BR"},      {"Maged", "ar-SA"},     {"Mariska", "hu-HU"},
++    {"Meijia", "zh-TW"},       {"Melina", "el-GR"},    {"Milena", "ru-RU"},
++    {"Moira", "en-IE"},        {"Monica", "es-ES"},    {"Nora", "nb-NO"},
++    {"Paulina", "es-MX"},      {"Rishi", "en-IN"},     {"Samantha", "en-US"},
++    {"Sara", "da-DK"},         {"Satu", "fi-FI"},      {"Sinji", "zh-HK"},
++    {"Tessa", "en-ZA"},        {"Thomas", "fr-FR"},    {"Tingting", "zh-CN"},
++    {"Xander", "nl-NL"},       {"Yelda", "tr-TR"},     {"Yuna", "ko-KR"},
++    {"Zosia", "pl-PL"},        {"Zuzana", "cs-CZ"},
++};
++
++// The locale the profile declares, lower-cased, taken from the switches Veil derives from one field.
++// `--accept-lang` first: `chrome/browser/prefs/chrome_command_line_pref_store.cc:50` maps it onto the
++// `kSelectedLanguages` pref, which is the value that becomes `navigator.languages`, so reading the
++// switch here reads the source of the string a page compares this catalogue against rather than a
++// copy of it. `--lang` is the fallback, and an empty answer is possible and handled.
++//
++// Both switch names are string literals on purpose. `kAcceptLang` is declared in
++// `chrome/common/chrome_switches.cc:28` and `kLang` in `ui/base/ui_base_switches.cc`, and neither
++// `components/ungoogled` nor `content/` -- this header's two consumers -- may include `chrome/`.
++inline std::string ClaimedLocale() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line) {
++    return std::string();
++  }
++  std::string value;
++  if (command_line->HasSwitch("accept-lang")) {
++    value = command_line->GetSwitchValueASCII("accept-lang");
++  } else if (command_line->HasSwitch("lang")) {
++    value = command_line->GetSwitchValueASCII("lang");
++  }
++  const size_t comma = value.find(',');
++  if (comma != std::string::npos) {
++    value = value.substr(0, comma);
++  }
++  const size_t semicolon = value.find(';');
++  if (semicolon != std::string::npos) {
++    value = value.substr(0, semicolon);
++  }
++  return base::ToLowerASCII(base::TrimWhitespaceASCII(value, base::TRIM_ALL));
++}
++
++// Which row a macOS configured for `locale` would have selected in System Settings, by the same
++// two-step every locale lookup in this patch set performs: the full tag first, then the language
++// subtag. `-1` when the roster has no voice for that language, which is a real state -- a Mac set to
++// a language Apple ships no voice for still reports the whole roster, with its en-US default.
++inline int DefaultVoiceIndex(const std::string& locale) {
++  if (locale.empty()) {
++    return -1;
++  }
++  for (size_t i = 0; i < std::size(kMacOSVoices); ++i) {
++    if (base::ToLowerASCII(kMacOSVoices[i].lang) == locale) {
++      return static_cast<int>(i);
++    }
++  }
++  const std::string language = locale.substr(0, locale.find('-'));
++  for (size_t i = 0; i < std::size(kMacOSVoices); ++i) {
++    const std::string row = base::ToLowerASCII(kMacOSVoices[i].lang);
++    if (row.substr(0, row.find('-')) == language) {
++      return static_cast<int>(i);
++    }
++  }
++  return -1;
++}
++
++// The catalogue to present, or false to leave the host's alone.
++//
++// True with an **empty** `out` is a real answer and not a failure: that is the Linux claim, and
++// falling through on it would report Windows voices on a machine claiming Linux.
++inline bool ClaimedVoiceCatalogue(std::vector<Voice>* out) {
++  if (!platform_claim::ShouldPresentOtherPlatform()) {
++    return false;
++  }
++  const std::string claimed = platform_claim::Claimed();
++  out->clear();
++  if (claimed == "linux") {
++    return true;
++  }
++  if (claimed != "macos") {
++    // No roster for this claim -- `android` and `ios` reach no patch in this set, and a Windows claim
++    // on a Windows build is the same-platform case the gate above already returned on.
++    return false;
++  }
++  const int default_index = DefaultVoiceIndex(ClaimedLocale());
++  // `tts_mac.mm` moves the system default voice to the front of the name-sorted list, and the mojo
++  // layer then marks index 0 as `default`. Reproducing the move rather than setting a flag is what
++  // makes the default voice's `lang` agree with `navigator.language` instead of contradicting it.
++  if (default_index >= 0) {
++    out->push_back(Voice{kMacOSVoices[default_index].name, kMacOSVoices[default_index].lang});
++  }
++  for (size_t i = 0; i < std::size(kMacOSVoices); ++i) {
++    if (static_cast<int>(i) == default_index) {
++      continue;
++    }
++    out->push_back(Voice{kMacOSVoices[i].name, kMacOSVoices[i].lang});
++  }
++  return true;
++}
++
++}  // namespace voice_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_VOICE_PERSONA_H_
+
+diff --git a/content/browser/speech/speech_synthesis_impl.cc b/content/browser/speech/speech_synthesis_impl.cc
+--- a/content/browser/speech/speech_synthesis_impl.cc
++++ b/content/browser/speech/speech_synthesis_impl.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/browser/speech/speech_synthesis_impl.h"
+ 
++#include "components/ungoogled/voice_persona.h"
+ #include "content/browser/media/audio_stream_monitor.h"
+ #include "content/browser/renderer_host/render_frame_host_impl.h"
+ #include "content/browser/speech/tts_utterance_impl.h"
+@@ -99,6 +100,45 @@
+ void SendVoiceListToObserver(
+     blink::mojom::SpeechSynthesisVoiceListObserver* observer,
+     const std::vector<VoiceData>& voices) {
++  // Veil 968: present the claimed platform's catalogue instead of the host's. The host's list is
++  // installed by the operating system and by its language packs, so it names the platform *and* the
++  // locale in one read -- measured as three `Microsoft ... (zh-CN)` voices on a persona claiming an
++  // `en-US` Apple M3.
++  //
++  // Substituted here, before the mapping below rather than instead of it, so the persona's entries
++  // reach the page through exactly the code path a real voice takes: `name` into `voiceURI` as well,
++  // `is_local_service` from `remote`, and `is_default` from position 0. And substituted in *this*
++  // function because both emission paths call it -- the initial `AddVoiceListObserver` and the
++  // `OnVoicesChanged` broadcast -- so neither can disagree with the other.
++  //
++  // Nothing is filled synchronously in the renderer, deliberately. Stock Chrome's first
++  // `getVoices()` on a fresh document returns `[]` and the real list arrives later with a
++  // `voiceschanged` event; measured `firstSyncCount: 0` on stock Chrome 151 and on this engine. A
++  // renderer-side backfill would answer the first call completely, which is an ordering tell
++  // independent of whether the values are right -- and it would be a second implementation of one
++  // fact, which 6.9 forbids for the same reason it dropped the persona struct.
++  std::vector<ungoogled::voice_persona::Voice> persona_voices;
++  const bool present_persona =
++      ungoogled::voice_persona::ClaimedVoiceCatalogue(&persona_voices);
++  if (present_persona) {
++    std::vector<blink::mojom::SpeechSynthesisVoicePtr> persona_out;
++    persona_out.reserve(persona_voices.size());
++    for (size_t i = 0; i < persona_voices.size(); ++i) {
++      blink::mojom::SpeechSynthesisVoicePtr out_voice =
++          blink::mojom::SpeechSynthesisVoice::New();
++      out_voice->voice_uri = persona_voices[i].name;
++      out_voice->name = persona_voices[i].name;
++      out_voice->lang = persona_voices[i].lang;
++      out_voice->is_local_service = true;
++      out_voice->is_default = (i == 0);
++      persona_out.push_back(std::move(out_voice));
++    }
++    // An empty catalogue is emitted as an empty list rather than falling through: that is the Linux
++    // claim, and the host's Windows voices under a Linux persona would be the contradiction this
++    // patch removes, pointing the other way.
++    observer->OnSetVoiceList(std::move(persona_out));
++    return;
++  }
+   std::vector<blink::mojom::SpeechSynthesisVoicePtr> out_voices;
+   out_voices.resize(voices.size());
+   for (size_t i = 0; i < voices.size(); ++i) {

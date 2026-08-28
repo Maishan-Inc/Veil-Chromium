@@ -39,15 +39,18 @@ CI trim in this fork is documented in the header of
 [`adryfish/fingerprint-chromium`][fc] — BSD-3-Clause.
 
 Source of the Tier 1 patch set: switch registration and seed plumbing, UA/UA-CH coherence, canvas
-(`getImageData`, `toDataURL`, `measureText`), `getClientRects`, WebGL `readPixels`, GPU info,
+(`getImageData`, `toDataURL`, `measureText`), WebGL `readPixels`, GPU info,
 font enumeration, `hardwareConcurrency`, timezone-as-a-switch, and the `navigator.webdriver` /
 headless / `Runtime.enable` surfaces.
 
-Two of its patches are **not** shipped: `007-shadow-root`, which added an ungated
-`Element.fakeShadowRoot` marker rather than closing a surface, and `003-audio-fingerprint`, whose
+Three of its patches are **not** shipped. `007-shadow-root` added an ungated
+`Element.fakeShadowRoot` marker rather than closing a surface. `003-audio-fingerprint`'s
 perturbation of the reported sample rate was both illegal (an `OfflineAudioContext` must report the
-rate the page asked for) and quantised away for about a seed in five. The audio surface is now Veil's
-own — see **Veil** below.
+rate the page asked for) and quantised away for about a seed in five; the audio surface is now Veil's
+own — see **Veil** below. And `014-client-rects` translated the whole document by a seed-derived
+±0.001 px, which left every width, height and inter-element distance bit-identical to stock while
+putting the coordinates off Chromium's 1/64 `LayoutUnit` grid — a protection with no effect and a tell
+that costs one expression to read, dropped in Stage 6 T09.
 
 ## clearcote-browser
 
@@ -60,6 +63,16 @@ HTTP/2 persona. Its dedicated coherence patches (`092-language-locale-coherence`
 `075-webgpu-coherence`, `160-coherence-misc`) are the reference for keeping surfaces from contradicting
 each other, and `070-webgl-gpu`'s downward-clamp argument — never report a limit above what the driver
 can deliver, because an upward claim is falsifiable by allocation — is carried into Veil's `963`.
+
+Stage 6's phase 3 took **arguments and call-site sets, not code**, from three more of its patches, and
+each Veil patch header says so in full: `170-speech-voices` for substituting the voice list in the one
+function both emission paths share and for never filling `getVoices()` synchronously (`968`);
+`147-media-capabilities` for overriding at the last codec-aware point and for never over-claiming a codec
+the table does not speak for (`969`); `020-audio` for the rule that a substituted latency must land on a
+grid genuine Chrome can produce (`967`). Their persona-struct rung and their tables are not carried —
+6.9 in `Veil/docs/MIGRATION-UNGOOGLED.md` records why — and `148-media-devices`' wholesale replacement of
+the device list is deliberately **not** taken, because `getUserMedia()` resolves out of the same
+enumeration (6.15).
 
 ## Brave
 
@@ -106,6 +119,24 @@ Present in this range today:
   ANGLE's own D3D11 and Metal backends, clamped down to the live driver, with every algebraically
   dependent limit derived after the clamp. Takes the call-site set and the clamp argument from
   clearcote's `070-webgl-gpu`; the numbers, the derivation and the extension handling are Veil's.
+- `967-audio-device-persona` — answers `AudioContext.baseLatency` from the output buffer size the
+  claimed platform's own Chromium backend would choose (256 frames on macOS, 512 on Linux, both
+  transcribed with a line citation) instead of from the host's audio device, whose 10 ms WASAPI period
+  is a Windows signature. Leaves `outputLatency` and `maxChannelCount` alone, and the measurement that
+  says why is in the patch header.
+- `968-speech-voice-persona` — presents the claimed platform's `speechSynthesis` catalogue in place of
+  the host's, which is installed by the OS and its language packs and so names the platform *and* the
+  locale in one read. The list-building shape is transcribed from `content/browser/speech/tts_mac.mm`;
+  the roster is Veil's, deliberately smaller than a maximal Mac's rather than invented.
+- `969-media-devices-and-codec-persona` — HEVC support answered once where `canPlayType`, MSE and
+  `decodingInfo().supported` all arrive, the hardware-decode set keyed on the Apple part `011` picked
+  for the seed, and one described capture device added for a kind the host does **not** have. Additive
+  by design: a present device is never replaced, because `getUserMedia()` resolves out of the same
+  enumeration.
+- `972-generic-families-and-local-fonts` — the CSS generics resolve to the faces the claimed platform's
+  Chrome defaults to (`chrome/app/resources/locale_settings_mac.grd`), so `monospace` stops falling
+  through to a proportional face; and `queryLocalFonts()` is filtered by the same membership rule `006`
+  and `906` apply, from the same tables, instead of enumerating the host's real set.
 
 ## Notes on licensing
 

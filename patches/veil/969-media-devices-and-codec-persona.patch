@@ -1,0 +1,440 @@
+# Origin:  none -- Veil-authored. clearcotelabs/clearcote-browser's `147-media-capabilities` and
+#          `148-media-devices` were audited as the counterparts (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+#          and neither is the source. Both read `ungoogled::CurrentPersona()` -- `.media_codecs` and
+#          `.media_devices` -- which 6.9 rejected as a second identity source, and `147` also pins the
+#          Worker/EME branch and `smooth`, which this patch deliberately does not. What transferred is
+#          the set of call sites and two arguments, credited as arguments: substitute at the last
+#          codec-aware point, and never over-claim a codec the table does not speak for.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# THREE surfaces, one header, because they are three answers to one question and a page can compare
+# them in three lines:
+#
+# 1. **`canPlayType` / `MediaSource.isTypeSupported`.** Measured on the shipping engine and on stock
+#    Chrome 151: HEVC unsupported (`""` and `false`) on this Windows host, on a persona claiming an
+#    Apple M3. Every Mac Apple has shipped since Kaby Lake decodes HEVC through VideoToolbox, so this
+#    is the loudest single thing the codec block can say about the claim. Answered in
+#    `media/base/supported_types.cc`, which is where all three JS entry points arrive, so one answer
+#    cannot disagree with itself. Main and Main10 only.
+# 2. **`mediaCapabilities.decodingInfo().powerEfficient`.** The GPU branch reports the *host* card's
+#    hardware-decode answer verbatim, which is a GeForce GT 705 speaking next to an Apple M3 renderer
+#    string. Replaced with the claimed part's: H.264 and HEVC hardware on every Mac, VP8 and VP9
+#    software on Apple Silicon, AV1 hardware on the M3 and M4 families only -- keyed on the model
+#    `011` picked for this seed, over `011`'s own table, so the two surfaces are two reads of one
+#    machine. Seed 424242 selects index 5 of eleven, `M3`, which is the renderer string the committed
+#    persona already carries.
+# 3. **`mediaDevices.enumerateDevices()`.** Measured: one `audiooutput`, no microphone, no camera --
+#    a server, which is what this host is. A laptop persona has all three kinds.
+#
+# THE DEVICE RULE IS ADDITIVE, AND THAT IS THE WHOLE DESIGN. An absent kind gains one described entry;
+# a present kind is never replaced or trimmed. `getUserMedia()` resolves the device a page asked for
+# out of this same enumeration, so substituting a described microphone for a real one would leave the
+# user unable to make a call -- a Compatibility cost that the fingerprint gain does not justify, and
+# the reason `148`'s wholesale replacement is not taken. Adding a kind the host lacks costs nothing
+# that worked: capture there was already impossible. Same direction as `963`'s clamp-down and `967`'s
+# refusal to raise a channel count.
+#
+# TWO ROWS THIS RE-SCOPES BY MEASUREMENT rather than by choice (6.15):
+#
+# - **`getSupportedConstraints()` gets no patch.** The inventory lists it as `969`'s. It is a fixed IDL
+#   dictionary (`third_party/blink/renderer/modules/mediastream/media_track_supported_constraints.idl`)
+#   whose only conditionals are three `[RuntimeEnabled]` features, and all three are decided by feature
+#   state rather than by platform: `MediaCaptureBackgroundBlur` and `MediaCaptureCameraControls` are
+#   `experimental` and `RestrictOwnAudio` is `stable`
+#   (`runtime_enabled_features.json5:3990,3997,5152`). So 36 keys is what every desktop platform
+#   reports, the measured 36 here included, and there is nothing platform-bound to move. Same shape as
+#   `963` leaving `getContextAttributes()` alone once it turned out to carry no device identity.
+# - **The main-frame/Worker `powerEfficient` split is preserved.** 6.6 recorded it as a decision T11
+#   owed: stock Chrome reports `false` in a document and `true` in a Worker for the same supported
+#   codec, because the Worker has no `gpu_factories` and falls to the perf-history branch. Measured
+#   again here on stock Chrome 151 and on this engine, both realms, before deciding. This patch moves
+#   the GPU branch only. Pinning both would make Veil *more* self-consistent than Chrome, which is its
+#   own tell, and `smooth` is left on the perf-history value for the same reason.
+#
+# THE RESIDUAL, and it is a real one: this engine cannot actually decode HEVC on a Windows host, so a
+# page that *plays* an HEVC stream fails where a real Mac plays it. Playing is a much rarer probe than
+# asking, and a playback failure reads like a busy decoder or a mislabelled stream, where "no HEVC at
+# all" reads as "not a Mac" from one line of JS. Recorded in 6.15 with the same standing as `906`'s
+# advance-width residual: known, measured, and not fixable in the engine on this host.
+#
+# No switch is added. `--fingerprint`, `--fingerprint-platform` and the seed drive all three surfaces;
+# `--disable-spoofing=gpu` opts the two codec surfaces out, which is the correct key rather than a new
+# one: they are hardware-decode claims about the GPU `011` names, and with the GPU spoof off the real
+# card is back and the claim would contradict *it*. The device roster has no key, because Veil has no
+# field for it and a switch value nothing can emit is the same lie as a switch no Chromium has.
+#
+# `media/DEPS` gains `+components/ungoogled` and `media/base/BUILD.gn` the matching dep. That is a
+# component the media layer may depend on: it holds the switch constants and the per-claim tables, and
+# it depends on `//base` alone, so it cannot close a cycle. `media/base` already deps on
+# `//components/system_media_controls/linux/buildflags`, which is the same shape.
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -7,6 +7,7 @@
+     "audio_persona.h",
+     "display_persona.h",
+     "fingerprint_data.h",
++    "media_persona.h",
+     "platform_claim.h",
+     "ungoogled_switches.h",
+     "ungoogled_switches.cc",
+
+diff --git a/components/ungoogled/media_persona.h b/components/ungoogled/media_persona.h
+new file mode 100644
+index 0000000000..e3b8b4d0b1
+--- /dev/null
++++ b/components/ungoogled/media_persona.h
+@@ -0,0 +1,166 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// What the claimed machine can decode, and which media devices it has.
++//
++// Three call sites in two processes: `media/base/supported_types.cc` answers `canPlayType` and
++// `MediaSource.isTypeSupported`, `modules/media_capabilities` answers `decodingInfo()`'s
++// `powerEfficient`, and `content/browser/.../media_devices_manager.cc` answers
++// `enumerateDevices()`. One header so the three cannot disagree: a machine that reports HEVC
++// unsupported and HEVC power-efficient in the same breath is worse than one that reports neither.
++//
++// The codec claims are kept as narrow as the evidence. Two of them are properties of *Chromium* and
++// are cited to this tree; two are properties of Apple's video engine and are stated as such:
++//
++//   HEVC   -- macOS reaches HEVC through VideoToolbox, and Chromium asks the OS whether the hardware
++//             has it (`media/gpu/mac/video_toolbox_video_decoder.cc:67-71` behind
++//             `ENABLE_HEVC_PARSER_AND_HW_DECODER`, feeding the supplemental profile cache that
++//             `media/base/supported_types.cc:243` reads). Every Mac Apple has shipped since Kaby Lake
++//             answers yes, Apple Silicon included, so a Mac claim commits to HEVC Main and Main10.
++//   H.264  -- `SupportsH264()` is `VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)`
++//             (`video_toolbox_video_decoder.cc:44`), true on every Mac.
++//   VP8    -- there is no VideoToolbox VP8 path in this tree at all, so never hardware.
++//   VP9    -- gated on `VTRegisterSupplementalVideoDecoderIfAvailable` plus
++//             `VTIsHardwareDecodeSupported` (`:48-61`), i.e. on the part. Apple Silicon has no VP9
++//             decode block, so this claims **software**: the conservative direction, and the one that
++//             matches every M-series Mac.
++//   AV1    -- hardware on the M3 and M4 families and on nothing older, so this is keyed on the Apple
++//             part `011` picked for the seed. That is the cross-check T11 exists to make: the codec
++//             answer and the renderer string are two reads of one machine.
++//
++// The device roster is the other half. Pre-permission Chrome exposes at most one device per *kind*
++// with an empty label and an empty `deviceId` -- measured on this host, where the only kind present is
++// `audiooutput`, count 1. A laptop persona has a built-in microphone, a built-in camera and built-in
++// speakers, so the claim is one of each: three kinds, still blank, which is what a MacBook reports
++// before a permission prompt.
++
++#ifndef COMPONENTS_UNGOOGLED_MEDIA_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_MEDIA_PERSONA_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/fingerprint_data.h"
++#include "components/ungoogled/platform_claim.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace media_persona {
++
++// The five families the probe asks about, which are also the five `MediaCapabilities` is asked about
++// in practice. A `media::VideoCodec` cannot be named here: `media/base` includes this header, so
++// naming its types would close a dependency cycle.
++enum class VideoFamily { kH264, kHEVC, kVP8, kVP9, kAV1 };
++
++// The Apple part `011` picked for this seed, or empty when no Mac is claimed.
++//
++// `011` selects with `fingerprint % kMacosGpuModelCount` over the table in `fingerprint_data.h`
++// (`third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc`, `GetGLRendererString`), and the seed
++// is parsed with `base::StringToUint`. Reproduced here rather than re-derived: the table is the one
++// source, and reading it with the same index is reading that source. The formula belongs in one place
++// eventually -- the same follow-up `platform_claim.h` records for `display_persona.h`'s copy of
++// `ClaimedPlatform()`.
++inline std::string ClaimedMacGpuModel() {
++  if (platform_claim::Claimed() != "macos") {
++    return std::string();
++  }
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line || !command_line->HasSwitch(::switches::kFingerprint)) {
++    return std::string();
++  }
++  uint32_t fingerprint = 0;
++  base::StringToUint(command_line->GetSwitchValueASCII(::switches::kFingerprint),
++                     &fingerprint);
++  return fingerprint::kMacosGpuModels[fingerprint %
++                                      fingerprint::kMacosGpuModelCount];
++}
++
++// Does the claimed platform's Chromium report HEVC decode support? Consulted by
++// `supported_types.cc`, so it drives `canPlayType`, `MediaSource.isTypeSupported` and
++// `decodingInfo().supported` from one answer.
++inline bool ClaimedPlatformDecodesHevc() {
++  return platform_claim::ShouldPresentOtherPlatform("gpu") &&
++         platform_claim::Claimed() == "macos";
++}
++
++// Does the claimed platform decode this family in hardware? `false` means "no platform is claimed,
++// or Veil describes no hardware-decode set for it" and leaves the host's answer in place -- the five
++// families below are the only ones this patch speaks for, so VC-1, MPEG-2, Theora and Dolby Vision
++// keep the real answer rather than being over-claimed. On `true`, `*out` is what the claimed machine
++// reports as `powerEfficient` on the GPU branch of `decodingInfo()`.
++inline bool ClaimedHardwareDecode(VideoFamily family, bool* out) {
++  if (!platform_claim::ShouldPresentOtherPlatform("gpu") ||
++      platform_claim::Claimed() != "macos") {
++    return false;
++  }
++  switch (family) {
++    case VideoFamily::kH264:
++    case VideoFamily::kHEVC:
++      *out = true;
++      return true;
++    case VideoFamily::kVP8:
++    case VideoFamily::kVP9:
++      *out = false;
++      return true;
++    case VideoFamily::kAV1: {
++      const std::string model = ClaimedMacGpuModel();
++      *out = model.compare(0, 2, "M3") == 0 || model.compare(0, 2, "M4") == 0;
++      return true;
++    }
++  }
++  return false;
++}
++
++// The device kinds the claimed machine has, and the one entry to present for each. False leaves the
++// host's enumeration alone.
++//
++// **Absent kinds are added; present kinds are never replaced or trimmed.** That is the whole rule, and
++// it is the direction `963` clamps in and `967` refuses to raise in. Replacing a real microphone with
++// a described one would leave `getUserMedia()` unable to resolve any device, so a fingerprint browser
++// would stop being able to make a video call -- a Compatibility cost the fingerprint gain does not
++// justify. Adding a kind the host does not have costs nothing that worked: capture was already
++// impossible there. The tell this closes is the one that matters -- a machine reporting *no*
++// microphone and *no* camera is a server or a VM, which is what this build host is.
++//
++// The residual, recorded in 6.15: on a host that does have a microphone, its real label is still
++// exposed once the user grants a permission, and on a Mac persona that label names the wrong machine.
++// Closing it means replacing the device, which is the thing above.
++struct DeviceKinds {
++  bool audio_input = false;
++  bool video_input = false;
++  bool audio_output = false;
++};
++
++inline bool ClaimedDeviceKinds(DeviceKinds* out) {
++  if (!platform_claim::ShouldPresentOtherPlatform()) {
++    return false;
++  }
++  // A laptop, which is what every persona in this patch set claims: one built-in microphone, one
++  // built-in camera, one built-in output.
++  *out = DeviceKinds{true, true, true};
++  return true;
++}
++
++// Labels for the two kinds a device-less host is missing. They are only ever observable *after* the
++// user grants a capture permission -- pre-permission Chrome blanks every field and emits one entry per
++// kind (`media_devices_manager.cc:1199`) -- so they are named for the claimed machine rather than left
++// empty, which no real enumeration is.
++inline const char* ClaimedAudioInputLabel() {
++  return platform_claim::Claimed() == "macos" ? "MacBook Pro Microphone"
++                                              : "Built-in Microphone";
++}
++
++inline const char* ClaimedVideoInputLabel() {
++  return platform_claim::Claimed() == "macos" ? "FaceTime HD Camera"
++                                              : "Integrated Camera";
++}
++
++}  // namespace media_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_MEDIA_PERSONA_H_
+
+diff --git a/media/DEPS b/media/DEPS
+--- a/media/DEPS
++++ b/media/DEPS
+@@ -4,6 +4,10 @@
+   "+cc/paint",
+   "+components/crash/core/common/crash_key.h",
+   "+components/system_media_controls/linux/buildflags",
++  # Veil 969: components/ungoogled is the home of the fingerprint switch constants and of the
++  # per-claim tables the patch set derives from them. It depends on //base and nothing else, so it
++  # cannot close a cycle back into media/.
++  "+components/ungoogled",
+   "+components/viz/common/resources",
+   "+crypto",
+   "+device/udev_linux",
+
+diff --git a/media/base/BUILD.gn b/media/base/BUILD.gn
+--- a/media/base/BUILD.gn
++++ b/media/base/BUILD.gn
+@@ -417,6 +417,7 @@
+     "//base",
+     "//base/allocator:buildflags",
+     "//components/system_media_controls/linux/buildflags",
++    "//components/ungoogled:ungoogled_switches",
+     "//gpu/command_buffer/client:interface_base",
+     "//gpu/command_buffer/client:raster_interface",
+     "//gpu/command_buffer/common",
+
+diff --git a/media/base/supported_types.cc b/media/base/supported_types.cc
+--- a/media/base/supported_types.cc
++++ b/media/base/supported_types.cc
+@@ -10,6 +10,7 @@
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/media_persona.h"
+ #include "media/base/media.h"
+ #include "media/base/media_client.h"
+ #include "media/base/media_switches.h"
+@@ -233,6 +234,24 @@
+     return false;
+   }
+ 
++  // Veil 969: a macOS persona decodes HEVC. Every Mac Apple has shipped since Kaby Lake reaches HEVC
++  // through VideoToolbox and answers `VTIsHardwareDecodeSupported` yes, which is what fills the
++  // supplemental profile cache consulted below on a real Mac -- so "HEVC unsupported" is the single
++  // loudest thing this block can say about a machine claiming an Apple part. Answered here rather
++  // than at the three JS entry points because `canPlayType`, `MediaSource.isTypeSupported` and
++  // `decodingInfo().supported` all arrive here: one answer cannot disagree with itself.
++  //
++  // Main and Main10 only. Those are the two profiles a Mac decodes and the two a page asks about;
++  // range extensions and the 4:4:4 profiles depend on the part and are left unclaimed.
++  //
++  // The residual is written down in Veil/docs/MIGRATION-UNGOOGLED.md 6.15 rather than hidden: this
++  // engine cannot actually decode HEVC on a Windows host, so a page that *plays* an HEVC stream fails
++  // where a real Mac would play it. That is a rarer probe than the query, and its failure reads like a
++  // busy decoder or a mislabelled stream, where "no HEVC at all" reads as "not a Mac" in one line.
++  if (ungoogled::media_persona::ClaimedPlatformDecodesHevc()) {
++    return type.profile == HEVCPROFILE_MAIN || type.profile == HEVCPROFILE_MAIN10;
++  }
++
+ #if BUILDFLAG(ENABLE_PLATFORM_HEVC)
+ #if BUILDFLAG(PLATFORM_HAS_OPTIONAL_HEVC_DECODE_SUPPORT)
+ #if BUILDFLAG(IS_CHROMEOS)
+
+diff --git a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+--- a/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
++++ b/third_party/blink/renderer/modules/media_capabilities/media_capabilities.cc
+@@ -14,6 +14,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
++#include "components/ungoogled/media_persona.h"
+ #include "media/base/media_switches.h"
+ #include "media/base/media_util.h"
+ #include "media/base/mime_util.h"
+@@ -1550,6 +1551,47 @@
+   DCHECK(pending_cb_map_.Contains(callback_id));
+   PendingCallbackState* pending_cb = pending_cb_map_.at(callback_id);
+ 
++  // Veil 969: `is_supported` is the host GPU's answer to "can you decode this in hardware", and
++  // `ResolveCallbackIfReady` reports it verbatim as `powerEfficient`. On a cross-platform persona it
++  // is therefore the real card speaking next to a spoofed renderer string. Answer for the claimed
++  // part instead: VideoToolbox hardware decode covers H.264 and HEVC on every Mac, VP8 and VP9 are
++  // software on Apple Silicon, and AV1 is hardware on the M3 and M4 families only -- keyed on the very
++  // model `011` picked for this seed, so the codec answer and the renderer string are two reads of one
++  // machine rather than two claims. Families Veil does not speak for -- VC-1, MPEG-2, Theora, Dolby
++  // Vision -- keep the host's answer instead of being over-claimed.
++  //
++  // Only this branch moves. The DB branch -- workers, and the EME path, neither of which has
++  // `gpu_factories` -- keeps `db_is_power_efficient`, which is how stock Chrome comes to report
++  // `powerEfficient: false` in a document and `true` in a Worker for the same codec (measured on
++  // stock Chrome 151 and on this engine). Pinning both would make Veil more self-consistent than
++  // Chrome, and that is its own tell.
++  std::optional<ungoogled::media_persona::VideoFamily> veil_family;
++  switch (video_codec) {
++    case media::VideoCodec::kH264:
++      veil_family = ungoogled::media_persona::VideoFamily::kH264;
++      break;
++    case media::VideoCodec::kHEVC:
++      veil_family = ungoogled::media_persona::VideoFamily::kHEVC;
++      break;
++    case media::VideoCodec::kVP8:
++      veil_family = ungoogled::media_persona::VideoFamily::kVP8;
++      break;
++    case media::VideoCodec::kVP9:
++      veil_family = ungoogled::media_persona::VideoFamily::kVP9;
++      break;
++    case media::VideoCodec::kAV1:
++      veil_family = ungoogled::media_persona::VideoFamily::kAV1;
++      break;
++    default:
++      break;
++  }
++  bool veil_hardware = false;
++  if (veil_family.has_value() &&
++      ungoogled::media_persona::ClaimedHardwareDecode(*veil_family,
++                                                      &veil_hardware)) {
++    is_supported = veil_hardware;
++  }
++
+   pending_cb->is_gpu_factories_supported = is_supported;
+   pending_cb->is_builtin_video_codec =
+       media::IsDecoderBuiltInVideoCodec(video_codec);
+
+diff --git a/content/browser/renderer_host/media/media_devices_manager.cc b/content/browser/renderer_host/media/media_devices_manager.cc
+--- a/content/browser/renderer_host/media/media_devices_manager.cc
++++ b/content/browser/renderer_host/media/media_devices_manager.cc
+@@ -28,6 +28,7 @@
+ #include "base/threading/thread_checker.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/media_persona.h"
+ #include "content/browser/media/media_devices_permission_checker.h"
+ #include "content/browser/renderer_host/media/media_stream_manager.h"
+ #include "content/browser/renderer_host/media/video_capture_manager.h"
+@@ -1509,10 +1510,44 @@
+     const blink::WebMediaDeviceInfoArray& snapshot) {
+   DCHECK_CURRENTLY_ON(BrowserThread::IO);
+   DCHECK(blink::IsValidMediaDeviceType(type));
+-  UpdateSnapshot(type, snapshot);
++  // Veil 969: a persona claiming a laptop has a microphone and a camera. This host has neither -- it
++  // enumerates one `audiooutput` and nothing else, measured -- and "no microphone, no camera" is a
++  // server or a VM rather than the MacBook the rest of the persona describes.
++  //
++  // Only an **absent** kind is added, and only one entry: a present kind is never replaced or
++  // trimmed, because `getUserMedia()` resolves the device the page asked for out of this same
++  // enumeration, and a described microphone in place of a real one would leave the user unable to
++  // make a call. Adding a kind the host does not have costs nothing that worked. Injected before
++  // `UpdateSnapshot` so the entry flows through the ranking, group-id and per-origin-salt pipeline
++  // exactly as a real device does -- which is also what blanks its id and label until a permission is
++  // granted.
++  //
++  // `use_fake_devices_` is respected so `--use-fake-device-for-media-stream` still describes what it
++  // says it does.
++  ungoogled::media_persona::DeviceKinds veil_kinds;
++  blink::WebMediaDeviceInfoArray veil_snapshot;
++  bool veil_added = false;
++  if (snapshot.empty() && !use_fake_devices_ &&
++      ungoogled::media_persona::ClaimedDeviceKinds(&veil_kinds)) {
++    if (type == MediaDeviceType::kMediaAudioInput && veil_kinds.audio_input) {
++      veil_snapshot.emplace_back("veil-builtin-audio-input",
++                                 ungoogled::media_persona::ClaimedAudioInputLabel(),
++                                 "veil-builtin-audio-group");
++      veil_added = true;
++    } else if (type == MediaDeviceType::kMediaVideoInput &&
++               veil_kinds.video_input) {
++      veil_snapshot.emplace_back("veil-builtin-video-input",
++                                 ungoogled::media_persona::ClaimedVideoInputLabel(),
++                                 "veil-builtin-video-group");
++      veil_added = true;
++    }
++  }
++  const blink::WebMediaDeviceInfoArray& effective =
++      veil_added ? veil_snapshot : snapshot;
++  UpdateSnapshot(type, effective);
+   cache_infos_[static_cast<size_t>(type)].UpdateCompleted();
+   cache_is_populated_[static_cast<size_t>(type)] = true;
+-  SendLogMessage(GetDevicesEnumeratedLogString(request_id, type, snapshot));
++  SendLogMessage(GetDevicesEnumeratedLogString(request_id, type, effective));
+ 
+   if (cache_policies_[static_cast<size_t>(type)] == CachePolicy::NO_CACHE) {
+     for (auto& request : client_requests_) {

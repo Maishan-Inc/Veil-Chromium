@@ -1,0 +1,299 @@
+# Origin:  none -- Veil-authored. clearcotelabs/clearcote-browser's `020-audio` was audited as the
+#          counterpart (Veil/docs/MIGRATION-UNGOOGLED.md 6.5) and is NOT the source of this patch.
+#          It answers `baseLatency` and `outputLatency` from three fields on
+#          `ungoogled::CurrentPersona()` -- the second identity source 6.9 rejected -- and it also
+#          pins `AudioContext.sampleRate`, which Veil will not do: `003` was dropped for reporting a
+#          rate no browser can report (5.1u). One idea is taken and credited as an argument rather
+#          than as code: a substituted latency must land on a grid genuine Chrome can produce.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# `AudioContext.baseLatency` is the hardware output buffer divided by the sample rate, and the
+# hardware is the *host's*. On this Windows host it is 0.01 exactly -- the 10 ms WASAPI shared-mode
+# device period -- which is a one-read platform signature sitting next to a persona that claims an
+# Apple M3. This patch answers it from the frame count the claimed platform's own Chromium backend
+# would choose: 256 frames on macOS, 512 on Linux, and nothing at all on Windows, where there is no
+# constant to copy because `AudioManagerWin` takes the buffer from the device period itself. At the
+# persona's 44100 the macOS claim reports 256/44100 = 0.005804988662131519 in place of 0.01.
+#
+# Every number is transcribed from this tree's own audio backends with a line citation, which is
+# `963`'s rule: the backend is the thing that decides and it is in the repository. See
+# components/ungoogled/audio_persona.h for the three citations.
+#
+# THREE things this does not do, and the first two are re-scopings that the measurement produced
+# rather than choices (Veil/docs/MIGRATION-UNGOOGLED.md 6.14):
+#
+# - **`outputLatency` is left alone.** The inventory's E block reads "probe v4: 0.01 / **0**. A real
+#   output device does not report zero output latency". Measured: stock Google Chrome 151, on this
+#   host, in the same minute, also reports `outputLatency: 0` -- before *and* after an attempt to
+#   render, because `AudioContext.resume()` never settles without a user gesture and
+#   `output_position_.hardware_output_latency` stays 0 until the first callback. So zero is what any
+#   platform reports for the state the probe reads it in, and substituting clearcote's 0.015 there
+#   would *introduce* the contradiction it was supposed to remove. When a real user's context does
+#   render, the value is quantised to 8 ms without microphone permission
+#   (`AudioContext::GetOutputLatencyQuantizingFactor`), which leaves 0.008 / 0.016 / 0.024 as the only
+#   reachable values on either platform -- a grid too coarse to carry the platform difference this
+#   patch is about.
+#
+# - **`destination.maxChannelCount` is left alone.** Measured 2 on this host, which is exactly what a
+#   MacBook's built-in output reports, and the setter enforces it (`destination.channelCount = 3`
+#   throws `IndexSizeError` on both Chrome and this engine, so the getter and the bound already
+#   agree). A clamp would therefore change nothing measurable here, and this patch set does not
+#   advance a surface on a clean apply. The rule it *would* take is `963`'s: clamp **down** to the
+#   live device, never up, because a reported channel count above what the sink supports is a
+#   configuration the pipeline cannot honour. Recorded as revisitable in 6.14 for a host whose
+#   default output is not stereo.
+#
+# - **The sample rate stays exact**, so `baseLatency * sampleRate` is an integer frame count for any
+#   rate the context runs at, including a page-requested one. That is the same argument `950` makes.
+#
+# No switch is added. The behaviour follows `--fingerprint` and `--fingerprint-platform`, both of
+# which `000` already declares, so the flag dialect does not grow and none of the three mirrors moves.
+# `--disable-spoofing=audio` opts it out along with the render noise, which is the key the audio block
+# already has: a new key would be one no Veil field can emit, and a switch value nothing can send is
+# the same lie as a switch no Chromium has.
+#
+# components/ungoogled/platform_claim.h arrives with this patch and is shared by the rest of phase 3
+# (`968`, `969`, `972`). It holds the "what platform is claimed, is it this build's own, and has the
+# user opted out" trio that `002`, `006` and `011` each spell inline -- four more copies is four
+# places for `macos` to become `macOS`.
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -4,8 +4,10 @@
+ 
+ component("ungoogled_switches") {
+   sources = [
++    "audio_persona.h",
+     "display_persona.h",
+     "fingerprint_data.h",
++    "platform_claim.h",
+     "ungoogled_switches.h",
+     "ungoogled_switches.cc",
+   ]
+
+diff --git a/components/ungoogled/platform_claim.h b/components/ungoogled/platform_claim.h
+new file mode 100644
+index 0000000000..27868bc4fd
+--- /dev/null
++++ b/components/ungoogled/platform_claim.h
+@@ -0,0 +1,105 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// What platform does this command line claim, and is that this build's own platform?
++//
++// Four Stage 6 patches ask that question -- `967` (audio device metadata), `968` (the speech voice
++// catalogue), `969` (media devices and codec support) and `972` (generic font families) -- and two of
++// them run in the browser process while two run in a renderer. Before this header each site repeated
++// the same four lines that `002`, `006` and `011` repeat: read `--fingerprint-platform`, lower-case
++// it, fall back to the host, and compare. Four more copies of a comparison is four places for the
++// vocabulary to drift, and the vocabulary is load-bearing: `windows` | `macos` | `linux` is what
++// `--fingerprint-platform` accepts and what every table in this patch set is keyed on.
++//
++// `display_persona.h` still carries its own copy of `ClaimedPlatform()`. That is deliberate for now:
++// moving it here would edit `960`'s patch for a reason that has nothing to do with the display, and
++// its measurement was taken against the code as written. The cleanup is one commit whenever `960` is
++// next touched for a reason of its own.
++//
++// Nothing here spoofs anything. It answers two questions and holds the one opt-out check the rest of
++// the set uses, so a patch that forgets `--disable-spoofing` fails to compile rather than shipping a
++// switch the user set and the engine ignored.
++
++#ifndef COMPONENTS_UNGOOGLED_PLATFORM_CLAIM_H_
++#define COMPONENTS_UNGOOGLED_PLATFORM_CLAIM_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
++#include "build/build_config.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace platform_claim {
++
++// The platform this binary runs on, in `--fingerprint-platform`'s own vocabulary. Same mapping
++// `006` performs inline, kept identical on purpose -- a second spelling of "macos" would silently
++// disable every cross-platform branch in the set.
++inline const char* Host() {
++#if BUILDFLAG(IS_WIN)
++  return "windows";
++#elif BUILDFLAG(IS_MAC)
++  return "macos";
++#else
++  return "linux";
++#endif
++}
++
++// The seed. Every surface in this patch set is either seed-derived or platform-derived, and Veil
++// emits `--fingerprint-platform` only alongside a seed, so "is a persona being presented at all" is
++// one question with one answer.
++inline bool SeedPresent() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  return command_line && command_line->HasSwitch(::switches::kFingerprint);
++}
++
++// The platform the command line claims, lower-cased, or the host's when it claims none.
++inline std::string Claimed() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line || !command_line->HasSwitch(::switches::kFingerprintPlatform)) {
++    return std::string(Host());
++  }
++  const std::string claimed = base::ToLowerASCII(
++      command_line->GetSwitchValueASCII(::switches::kFingerprintPlatform));
++  return claimed.empty() ? std::string(Host()) : claimed;
++}
++
++// `--disable-spoofing=<a>,<b>` carries this key. Substring matching, which is what `006`, `011`,
++// `012`, `013`, `015`, `016` and `950` already do -- the keys share no prefix so the looser test has
++// the same result, and matching them differently here would make one opt-out behave unlike the rest.
++//
++// An empty key means "this surface has no opt-out", and it must answer false: `find("")` returns 0,
++// so the naive reading would report every surface opted out the moment the switch appears at all.
++inline bool SpoofingDisabled(std::string_view key) {
++  if (key.empty()) {
++    return false;
++  }
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line || !command_line->HasSwitch(::switches::kDisableSpoofing)) {
++    return false;
++  }
++  return command_line->GetSwitchValueASCII(::switches::kDisableSpoofing)
++             .find(std::string(key)) != std::string::npos;
++}
++
++// The condition every cross-platform table in this set is gated on: a seed is present, the claim is
++// not this build's own platform, and the surface has not been opted out.
++//
++// The same-platform case returns false on purpose. A Windows persona on a Windows host already
++// reports a plausible Windows machine, and substituting Veil's idea of one for the real one can only
++// replace a true value with a guess -- the argument `906` makes for the font list's same-OS branch.
++//
++// `opt_out_key` is empty for surfaces `--disable-spoofing` has no key for. Adding one would mean
++// adding a value no Veil field can emit, and a switch value nothing can send is the same lie as a
++// switch no Chromium has (CLAUDE.md, "Flag dialect").
++inline bool ShouldPresentOtherPlatform(std::string_view opt_out_key = std::string_view()) {
++  return SeedPresent() && Claimed() != Host() && !SpoofingDisabled(opt_out_key);
++}
++
++}  // namespace platform_claim
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_PLATFORM_CLAIM_H_
+
+diff --git a/components/ungoogled/audio_persona.h b/components/ungoogled/audio_persona.h
+new file mode 100644
+index 0000000000..0c1ad7f782
+--- /dev/null
++++ b/components/ungoogled/audio_persona.h
+@@ -0,0 +1,73 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The output buffer size the claimed platform's own Chromium would choose, which is the only thing
++// `AudioContext.baseLatency` reports: the spec defines it as the greater of the render quantum and
++// the hardware buffer, divided by the sample rate.
++//
++// Every number here is read out of this tree's own audio backends rather than from a specification or
++// a device data sheet, which is the rule `963` established for the WebGL capability tables. The
++// backend is the thing that decides, and it is in the repository:
++//
++//   macOS  -- `AudioManagerMac::ChooseBufferSize(is_input=false, rate)` asks for
++//             `2 * limits::kMinAudioBufferSize` and then routes it through
++//             `GetMinAudioBufferSizeMacOS`, so an output stream is **256 frames** at every rate up to
++//             96 kHz and 512 above it. `media/audio/mac/audio_manager_mac.cc:1083`,
++//             `:1552`, `media/base/limits.h:79`.
++//   linux  -- PulseAudio starts at `kMinimumOutputBufferSize`, **512 frames**.
++//             `media/audio/pulse/audio_manager_pulse.cc:32,223`. (ALSA would say 2048 --
++//             `media/audio/alsa/audio_manager_alsa.cc:336` -- and a desktop Linux Chrome goes through
++//             Pulse. The choice is recorded here rather than hidden: it is the more common of the two
++//             and the smaller claim.)
++//   windows-- there is no constant to copy. `AudioManagerWin` takes the buffer straight from
++//             `CoreAudioUtil::GetPreferredAudioParameters`, i.e. the device period, which on this
++//             host is 10 ms exactly (441 frames at 44.1 kHz, the measured 0.01).
++//             `media/audio/win/audio_manager_win.cc:361-379`.
++//
++// So a Windows claim keeps the host's real number -- there is nothing to substitute it *with* -- and
++// this engine is a Windows build, which makes the Windows claim the same-platform case anyway.
++//
++// The sample rate is deliberately **not** touched. `950` leaves `AudioContext.sampleRate` exact
++// because `003` was dropped for reporting a rate no browser can report (5.1u), and the same argument
++// applies here: baseLatency is derived from whatever rate the context actually runs at, so the pair
++// stays arithmetically consistent for any host rate and any page-requested rate.
++
++#ifndef COMPONENTS_UNGOOGLED_AUDIO_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_AUDIO_PERSONA_H_
++
++#include <string>
++
++#include "components/ungoogled/platform_claim.h"
++
++namespace ungoogled {
++namespace audio_persona {
++
++// Frames per output buffer for the claimed platform at `sample_rate`, or 0 when the claim is this
++// build's own platform, when no seed is present, or when `--disable-spoofing=audio` is set -- the
++// three cases where the host's real value is the honest answer.
++inline int ClaimedOutputBufferFrames(double sample_rate) {
++  if (!platform_claim::ShouldPresentOtherPlatform("audio")) {
++    return 0;
++  }
++  const std::string claimed = platform_claim::Claimed();
++  if (claimed == "macos") {
++    // AudioManagerMac::ChooseBufferSize(false, rate) -> GetMinAudioBufferSizeMacOS(256, rate).
++    // Faithful to the original's shape, including that it replaces the requested size with a
++    // multiple of kMinAudioBufferSize (128) rather than scaling it: 256 up to 96 kHz, 512 up to
++    // 192 kHz, and back to the requested 256 above that.
++    if (sample_rate > 96000 && sample_rate <= 192000) {
++      return 512;
++    }
++    return 256;
++  }
++  if (claimed == "linux") {
++    return 512;
++  }
++  return 0;
++}
++
++}  // namespace audio_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_AUDIO_PERSONA_H_
+
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_context.cc b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+@@ -13,6 +13,7 @@
+ #include "base/strings/to_string.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/audio_persona.h"
+ #include "media/audio/audio_device_description.h"
+ #include "media/base/output_device_info.h"
+ #include "services/metrics/public/cpp/ukm_builders.h"
+@@ -664,6 +665,18 @@
+                                        ->GetOwnHandler()
+                                        .GetFramesPerBuffer()),
+                static_cast<size_t>(renderQuantumSize()));
++  // Veil 967: on a cross-platform persona the hardware buffer is the *host's* audio backend, and it
++  // is a one-read platform signature -- 0.01 exactly is the 10 ms WASAPI device period, measured
++  // identical on stock Chrome 151 and on this engine. Substitute the frame count the claimed
++  // platform's own Chromium backend would choose and let the spec's own arithmetic below produce the
++  // latency, so `baseLatency * sampleRate` remains a plausible buffer size for any rate the context
++  // ends up running at. Returns 0 for the same-platform, seedless and `--disable-spoofing=audio`
++  // cases, which keep the host's real value.
++  const int claimed_frames = ungoogled::audio_persona::ClaimedOutputBufferFrames(sampleRate());
++  if (claimed_frames > 0) {
++    base_latency_frames = std::max(static_cast<size_t>(claimed_frames),
++                                   static_cast<size_t>(renderQuantumSize()));
++  }
+   base_latency_ = base_latency_frames / static_cast<double>(sampleRate());
+   SendLogMessage(__func__, String::Format("=> (base latency=%.3f seconds))",
+                                           base_latency_));

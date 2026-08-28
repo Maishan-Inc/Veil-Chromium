@@ -1,9 +1,12 @@
 # `patches/veil/` — Veil's fingerprint patch set
 
 Tier 1 (16 patches ported from `adryfish/fingerprint-chromium`) has landed; see
-`Veil/docs/MIGRATION-UNGOOGLED.md` → Stage 5 for the per-patch measurements. Every patch here is
-registered in `patches/series`, and the ordering in that file — not the numeric prefix — is the
-apply order.
+`Veil/docs/MIGRATION-UNGOOGLED.md` → Stage 5 for the per-patch measurements. **Thirteen of the sixteen
+ship** — `003`, `007` and `014` did not survive measurement, see "when a port turns out to be a net
+negative" below — beside four Veil-authored corrections (`902`, `906`, `915`, `950`) and, from Stage 6,
+patches for surfaces Tier 1 never reached (`960`, `963`, and phase 3's `967`, `968`, `969`, `972`).
+Every patch here is registered in `patches/series`, and the ordering in that file — not the numeric
+prefix — is the apply order.
 
 ## The rule that will bite you: append to `patches/series`
 
@@ -103,6 +106,29 @@ One exception has been needed so far, and it shows what the "say why" is for:
 because `011-gpu-info` extends the same `fingerprint_data.h` and applies after `002`. Keeping `902`
 last leaves `011` re-anchored against exactly the tree it was measured against, and puts the whole
 cost of a future rebase on the Veil-authored patch instead of on a ported one.
+
+### When a port turns out to be a net negative: drop it, do not neutralise it
+
+Three ports have failed measurement badly enough to stop shipping, and the shape of the fix differed:
+
+- `003-audio-fingerprint` was **replaced**. It perturbed the reported sample rate, which no real
+  browser can do, and did nothing at all for about a seed in five (5.1f, 5.1u). There was a surface
+  worth spoofing behind it, so `950-audio-render-noise` took over and `003` left the series.
+- `007-shadow-root` was **dropped**. It added a fingerprint surface rather than removing one (5.1s).
+- `014-client-rects` was **dropped**. It perturbed the half of `getClientRects` fingerprinters ignore
+  and put the half they read off Chromium's 1/64 `LayoutUnit` grid, which is a one-expression tell
+  (5.1l, 6.13).
+
+In all three the patch file left `patches/veil/` and its `series` entry went with it. **Do not write a
+`9NN` that neutralises its target instead.** Two patches whose net effect is nothing are two
+descriptions of one fact, and the series is meant to be the single statement of what this engine does
+— a reader who greps for `014` and finds it registered has to read `914` to learn that it does nothing.
+The `9NN` range is for *correcting* behaviour that should exist, not for cancelling behaviour that
+should not.
+
+The cost is a full rebuild of whatever the reverted patch touched, and it is not always small: `014`
+reaches `ui/gfx/geometry/quad_f.h`, so reverting it was a 7,714-target build. That is the price of the
+series being true.
 
 ## Naming
 
