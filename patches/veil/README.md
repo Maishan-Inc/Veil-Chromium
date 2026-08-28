@@ -4,7 +4,8 @@ Tier 1 (16 patches ported from `adryfish/fingerprint-chromium`) has landed; see
 `Veil/docs/MIGRATION-UNGOOGLED.md` → Stage 5 for the per-patch measurements. **Thirteen of the sixteen
 ship** — `003`, `007` and `014` did not survive measurement, see "when a port turns out to be a net
 negative" below — beside four Veil-authored corrections (`902`, `906`, `915`, `950`) and, from Stage 6,
-patches for surfaces Tier 1 never reached (`960`, `963`, and phase 3's `967`, `968`, `969`, `972`).
+patches for surfaces Tier 1 never reached (`960`, `963`, phase 3's `967`, `968`, `969`, `972`, and
+phase 4's `961`).
 Every patch here is registered in `patches/series`, and the ordering in that file — not the numeric
 prefix — is the apply order.
 

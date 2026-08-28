@@ -137,6 +137,13 @@ Present in this range today:
   Chrome defaults to (`chrome/app/resources/locale_settings_mac.grd`), so `monospace` stops falling
   through to a proportional face; and `queryLocalFonts()` is filtered by the same membership rule `006`
   and `906` apply, from the same tables, instead of enumerating the host's real set.
+- `961-touch-and-pointer-persona` — `navigator.maxTouchPoints` and the four pointer / hover media
+  features answered from one number, in the single browser-side place all five are written
+  (`SlowWebPreferenceCache::Load`). A macOS claim reports 0 because macOS builds
+  `ui/base/pointer/pointer_device_default.cc`, whose `MaxTouchPoints()` is a constant 0 — so the count
+  is not a market fact about Apple but a property of what Chromium compiles. Takes the one switch this
+  block needs, `--fingerprint-max-touch-points`, and nothing else from clearcote's `150`, which
+  overrides the getter alone and leaves the media queries contradicting it.
 
 ## Notes on licensing
 

@@ -44,3 +44,4 @@ veil/967-audio-device-persona.patch
 veil/968-speech-voice-persona.patch
 veil/969-media-devices-and-codec-persona.patch
 veil/972-generic-families-and-local-fonts.patch
+veil/961-touch-and-pointer-persona.patch

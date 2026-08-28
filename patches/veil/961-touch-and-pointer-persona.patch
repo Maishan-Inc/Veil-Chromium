@@ -1,0 +1,341 @@
+# Origin:  none -- Veil-authored. clearcotelabs/clearcote-browser's `150-device-sensors` was audited
+#          as the counterpart (Veil/docs/MIGRATION-UNGOOGLED.md 6.5) and is NOT the source of this
+#          patch. Despite its name it carries no sensor code and no Gamepad code; what it does carry
+#          for this task is a `NavigatorEvents::maxTouchPoints` override reading
+#          `--fingerprint-max-touch-points` with `ungoogled::CurrentPersona()` behind it -- the
+#          second identity source 6.9 rejected -- and its own comment claims the result is "coherent
+#          with CSS pointer:coarse" while touching no media query at all. One idea is taken and
+#          credited as an argument rather than as code: the switch, because the platform genuinely
+#          does not say whether a machine has a touchscreen.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# `navigator.maxTouchPoints` reported **10** on a persona claiming an Apple M3, and it was the
+# loudest contradiction assertion 6 still scored on the shipping engine -- one of two remaining
+# floors, the other being WebGPU, which needs a host this one cannot be. Apple has never shipped a
+# touchscreen Mac, so the count alone refutes the platform, and `(any-pointer: coarse)` matched
+# beside it, which refutes it a second time in one more line of CSS.
+#
+# ONE HOOK, FIVE SURFACES. `SlowWebPreferenceCache::Update()` fills six `WebPreferences` fields from
+# `ui::MaxTouchPoints()` and `ui::GetAvailablePointerAndHoverTypes()`; `Load()` copies them into
+# every renderer's prefs and is called from exactly one place
+# (content/browser/web_contents/web_contents_impl.cc:3800). Five web surfaces read the result:
+# `navigator.maxTouchPoints` (via `Settings::GetMaxTouchPoints`), `(pointer:)`, `(any-pointer:)`,
+# `(hover:)` and `(any-hover:)` (via `MediaValues::CalculateAvailablePointerTypes` and its three
+# siblings). Overriding `NavigatorEvents::maxTouchPoints` -- which is where the counterpart does it --
+# moves one of the five and leaves the other four contradicting it. This patch overrides `Load()`, in
+# the browser process, so all five come from one number.
+#
+# THE NUMBER. `--fingerprint-max-touch-points=<n>` first, then the claimed platform, then the host
+# untouched. The switch is honoured with or without a seed and on any claim, which is
+# `--fingerprint-hardware-concurrency`'s shape: a value the user typed is not a cross-platform
+# substitution, so it is not gated on one. The platform rung is gated on
+# `ShouldPresentOtherPlatform()`, so a seedless launch and a Windows-claim-on-Windows-host both fall
+# through -- `906`'s same-OS argument, third application.
+#
+# macOS answers **0 structurally**, and that is the strongest kind of claim this patch set makes:
+# ui/base/BUILD.gn:433-446 builds `pointer_device_win.cc` for Windows, `_android` / `_ios` / `_linux`
+# / `_web_engine` for theirs, and `pointer/pointer_device_default.cc` for everything else -- macOS
+# included. That file is 25 lines of constants (`MaxTouchPoints()` returns 0,
+# `GetAvailablePointerAndHoverTypesImpl()` returns `{POINTER_TYPE_FINE, HOVER_TYPE_HOVER}`,
+# `GetTouchScreensAvailability()` returns `NONE`). No Mac reports a touchscreen through this API even
+# if Apple ships one. Linux answers **0 modally** -- `pointer_device_linux.cc:33-40` reads
+# `DeviceDataManager`, so the platform does not decide, and 0 is chosen because the alternative is
+# this Windows host's digitizer count, which is a leak rather than a guess. The header says which row
+# is which out loud.
+#
+# The four pointer / hover fields are derived from the count by Chromium's own rules, with a line
+# citation each at the call site: a touchscreen *adds* COARSE beside FINE rather than replacing it
+# (`pointer_device_{win,linux}.cc`), and FINE and HOVER win their primary slots whenever available
+# (`pointer_device.cc:47-66`), so `primary_pointer_type` and `primary_hover_type` are computed, never
+# chosen.
+#
+# THREE THINGS THIS DOES NOT DO, and all three are re-scopings the control measurement produced
+# rather than choices. Stock Chrome 151, the packaged engine and this build were read back to back in
+# one minute (Veil/docs/MIGRATION-UNGOOGLED.md 6.18):
+#
+# - **`getBattery()` is left alone.** The inventory's row reads "`charging: true, level: 1` is the
+#   desktop default and is fine; a laptop persona that never discharges is not". Measured: all four
+#   fields are already the canonical AC-powered set -- `charging: true`, `chargingTime: 0`,
+#   `dischargingTime: Infinity`, `level: 1` -- and byte-identical on stock Chrome, so there is no
+#   divergence to close. They are also what a real MacBook reports plugged in at full charge, and
+#   `011`'s renderer string names a *part* (`Apple M3`), not a chassis, so nothing in the persona
+#   claims a machine that must be discharging. clearcote's `150` pins these four to exactly the
+#   values they already hold, which on this host is a no-op with a comment. Fabricating a discharge
+#   would mean a value that changes over time and must agree across three realms, which is a new
+#   surface rather than a closed contradiction.
+# - **The generic sensors are left alone, and the reason is in this tree.**
+#   `services/device/generic_sensor/platform_sensor_provider_mac.cc:17-25` is
+#   `CreateSensorInternal` running `std::move(callback).Run(nullptr)` for **every** sensor type, with
+#   a comment saying the hardware pokes stopped working long ago. So a real Mac fails every
+#   `Sensor.start()`, and this host fails it identically: `Accelerometer`, `Gyroscope`,
+#   `LinearAccelerationSensor`, `GravitySensor` and both orientation sensors are present with
+#   permission `granted` and answer `NotReadableError: Could not connect to a sensor`, while
+#   `Magnetometer` and `AmbientLightSensor` are absent on every platform because their constructors
+#   are behind build-level `RuntimeEnabledFeatures`. T02 refuted this task's original acceptance
+#   ("sensors absent on a desktop claim") and this refutes the replacement: the set already *is* the
+#   claimed platform's. One residual is named rather than patched -- a Windows host with a working
+#   accelerometer would stream readings where a Mac cannot, and suppressing that is unmeasurable on
+#   this host, so it is filed with T08's borrowed-hardware items instead of guessed at.
+# - **Gamepad is left alone.** `navigator.getGamepads()` returns 4 slots with nothing connected on
+#   all three binaries, and the array length is a Blink constant rather than a platform fact. Nothing
+#   measurable to move.
+#
+# NO `--disable-spoofing` KEY, and none is added. Veil has no field that could emit one for this
+# surface, and a switch value nothing can send is the same lie as a switch no Chromium has
+# (CLAUDE.md, "Flag dialect"). Leaving `--fingerprint-max-touch-points` unset is the opt-out: the
+# platform rung then answers only for a cross-platform claim, which is the case where the host's
+# count is a leak.
+#
+# The switch is declared in `components/ungoogled/ungoogled_switches` and read in the browser
+# process **only**. It is deliberately absent from
+# `RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer`'s allow-list: no renderer code reads
+# it, and propagating a switch into a process that never reads it would be a fifth instance of the
+# violation `000` already carries four of -- declared, propagated, read by nothing (6.9).
+#
+# Veil-authored `9NN` numbering: `961` has no `061` to correct, so it is in the `950`-`999` range
+# reserved for patches with no direct counterpart.
+
+diff --git a/components/ungoogled/ungoogled_switches.cc b/components/ungoogled/ungoogled_switches.cc
+--- a/components/ungoogled/ungoogled_switches.cc
++++ b/components/ungoogled/ungoogled_switches.cc
+@@ -51,4 +51,10 @@
+ // Specify the timezone
+ const char kFingerprintTimezone[] = "timezone";
+ 
++// Specify how many simultaneous touch points the machine reports. Veil-authored, added by `961`:
++// `000`'s twelve are fingerprint-chromium's set and this is not one of them. Read in the browser
++// process only (components/ungoogled/input_persona.h), so it is absent from
++// PropagateBrowserCommandLineToRenderer's allow-list on purpose.
++const char kFingerprintMaxTouchPoints[] = "fingerprint-max-touch-points";
++
+ }  // namespace switches
+
+diff --git a/components/ungoogled/ungoogled_switches.h b/components/ungoogled/ungoogled_switches.h
+--- a/components/ungoogled/ungoogled_switches.h
++++ b/components/ungoogled/ungoogled_switches.h
+@@ -27,6 +27,7 @@
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintPlatformVersion[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintLocation[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintTimezone[];
++COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintMaxTouchPoints[];
+ }
+ 
+ #endif  // THIRD_PARTY_UNGOOGLED_FINGERPRINTING_SWITCHES_H_
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -8,6 +8,7 @@
+     "display_persona.h",
+     "fingerprint_data.h",
+     "font_persona.h",
++    "input_persona.h",
+     "media_persona.h",
+     "platform_claim.h",
+     "ungoogled_switches.h",
+
+diff --git a/components/ungoogled/input_persona.h b/components/ungoogled/input_persona.h
+new file mode 100644
+index 0000000000..ce0b9eaa8c
+--- /dev/null
++++ b/components/ungoogled/input_persona.h
+@@ -0,0 +1,117 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// How many touch points does the claimed machine have, and does the user get to say?
++//
++// `navigator.maxTouchPoints`, `(pointer:)`, `(any-pointer:)`, `(hover:)` and `(any-hover:)` are five
++// reads of **one** browser-side answer: `SlowWebPreferenceCache::Update()` fills six
++// `WebPreferences` fields from `ui::MaxTouchPoints()` and `ui::GetAvailablePointerAndHoverTypes()`,
++// and `SlowWebPreferenceCache::Load()` copies all six into every renderer's prefs. That is why this
++// patch overrides `Load()` and not `NavigatorEvents::maxTouchPoints`: moving the count alone would
++// trade one contradiction for another, since a machine reporting 0 touch points while
++// `(any-pointer: coarse)` still matches is not a machine.
++//
++// Measured on this host, on both binaries and on stock Chrome 151 in the same minute: 10 touch
++// points, `(any-pointer: coarse)` **and** `(any-pointer: fine)`, `(hover: hover)`. The `persona`
++// case claims macOS, so all three are the loudest remaining contradiction assertion 6 scores
++// (`Veil/docs/MIGRATION-UNGOOGLED.md` -> 6.17).
++//
++// THE PLATFORM TABLE, and the two rows are not the same kind of claim.
++//
++// - **macOS: 0, structurally.** `ui/base/BUILD.gn:434-445` builds `pointer_device_win.cc` for
++//   Windows, `_android`, `_ios`, `_linux` and `_web_engine` for theirs, and
++//   `pointer/pointer_device_default.cc` for everything else -- macOS included. That file is 25 lines
++//   of constants: `MaxTouchPoints()` returns 0, `GetAvailablePointerAndHoverTypesImpl()` returns
++//   `{POINTER_TYPE_FINE, HOVER_TYPE_HOVER}`, `GetTouchScreensAvailability()` returns `NONE`
++//   (`ui/base/pointer/pointer_device_default.cc:13-24`). No Mac can report a touchscreen through
++//   this API even if Apple ships one, so this is a statement about what Chromium *builds* per
++//   platform -- the same class of claim as the identity strings, never a hardware spec sheet.
++// - **Linux: 0, modally.** `pointer_device_linux.cc:33-40` answers from `DeviceDataManager`'s
++//   touchscreen list, so the platform does not decide and a Linux touch laptop is real. 0 is chosen
++//   because the alternative is *this Windows host's* digitizer count, which is a leak rather than a
++//   guess, and the switch below is how a user says otherwise. The header says "modally" out loud so
++//   the next reader does not mistake it for the macOS row.
++// - **Windows: no override.** The claim is this build's own platform, so the host's real
++//   configuration is already a plausible Windows machine and substituting Veil's idea of one can
++//   only replace a true value with a guess. `906`'s same-OS argument, third application.
++//
++// THE SWITCH. `--fingerprint-max-touch-points=<n>` is the one switch phase 4's input block takes,
++// and it is taken because the platform genuinely does not carry the answer: a Windows or Linux
++// persona may or may not have a touchscreen, and no other field Veil sends implies it. Honoured
++// **with or without a seed and on any claim**, which is `--fingerprint-hardware-concurrency`'s
++// shape: a value the user typed is not a cross-platform substitution, so it is not gated on one.
++//
++// Declared in `ungoogled_switches` and read **here, in the browser process, only**. It is
++// deliberately *not* added to `PropagateBrowserCommandLineToRenderer`'s allow-list: no renderer code
++// reads it, and a switch propagated into a process that never reads it is the fourth instance of the
++// mirror violation `000` already carries four of -- declared, propagated, read by nothing (6.9).
++
++#ifndef COMPONENTS_UNGOOGLED_INPUT_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_INPUT_PERSONA_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/platform_claim.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace input_persona {
++
++// The count `--fingerprint-max-touch-points=<n>` asks for, if it is present and parses. A negative
++// value is rejected rather than clamped: `WebPreferences::pointer_events_max_touch_points` is an
++// `int` that reaches `Settings::SetMaxTouchPoints`, and a caller who typed one meant something this
++// code cannot guess.
++inline std::optional<int> RequestedTouchPoints() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line ||
++      !command_line->HasSwitch(::switches::kFingerprintMaxTouchPoints)) {
++    return std::nullopt;
++  }
++  int requested = 0;
++  if (!base::StringToInt(command_line->GetSwitchValueASCII(
++                             ::switches::kFingerprintMaxTouchPoints),
++                         &requested) ||
++      requested < 0) {
++    return std::nullopt;
++  }
++  return requested;
++}
++
++// The count the claimed platform implies, for a claim that is not this build's own. `std::nullopt`
++// means "this platform does not decide, leave the host's" -- which is every Windows claim, because a
++// Windows claim on a Windows host is the same-OS case.
++inline std::optional<int> TouchPointsForClaim(std::string_view claimed) {
++  if (claimed == "macos" || claimed == "linux") {
++    return 0;
++  }
++  return std::nullopt;
++}
++
++// The one answer the six prefs are derived from. Switch, then the claimed platform, then nothing.
++//
++// The platform rung is gated on `ShouldPresentOtherPlatform()`, so a seedless launch and a same-OS
++// claim both fall through to the host untouched. The switch rung is not gated at all.
++//
++// `--disable-spoofing` has no key for this surface and deliberately gains none: Veil has no field
++// that could emit one, and a switch value nothing can send is the same lie as a switch no Chromium
++// has (CLAUDE.md, "Flag dialect"). The `--fingerprint-max-touch-points` field is the opt-out --
++// leaving it unset is how a profile keeps the host's input configuration.
++inline std::optional<int> EffectiveTouchPoints() {
++  if (std::optional<int> requested = RequestedTouchPoints()) {
++    return requested;
++  }
++  if (!platform_claim::ShouldPresentOtherPlatform()) {
++    return std::nullopt;
++  }
++  return TouchPointsForClaim(platform_claim::Claimed());
++}
++
++}  // namespace input_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_INPUT_PERSONA_H_
+
+diff --git a/content/browser/web_contents/slow_web_preference_cache.cc b/content/browser/web_contents/slow_web_preference_cache.cc
+--- a/content/browser/web_contents/slow_web_preference_cache.cc
++++ b/content/browser/web_contents/slow_web_preference_cache.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "content/browser/web_contents/slow_web_preference_cache.h"
+ 
++#include <optional>
++
+ #include "base/command_line.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/no_destructor.h"
+@@ -11,6 +13,7 @@
+ #include "base/trace_event/optional_trace_event.h"
+ #include "build/blink_buildflags.h"
+ #include "content/public/common/content_switches.h"
++#include "components/ungoogled/input_persona.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+ #include "ui/base/pointer/pointer_device.h"
+ #include "ui/gl/gpu_switching_manager.h"
+@@ -48,6 +51,47 @@
+   kFine = 2,
+   kMaxValue = kFine
+ };
++
++// Veil `961`: the five input prefs a persona owns, answered from one touch-point count.
++//
++// `Update()` above fills them from `ui::MaxTouchPoints()` and
++// `ui::GetAvailablePointerAndHoverTypes()`, which are the *host's* devices. Five web surfaces read
++// the result -- `navigator.maxTouchPoints`, `(pointer:)`, `(any-pointer:)`, `(hover:)` and
++// `(any-hover:)` -- so overriding the count without the pointer types would trade one contradiction
++// for another: 0 touch points beside a matching `(any-pointer: coarse)` is not a machine. This is
++// the single place all five are written, which is why it is the hook.
++//
++// Where the count comes from, and why 0 is the macOS answer, is
++// components/ungoogled/input_persona.h. Here is only the mapping from a count to the four pointer
++// and hover fields, and each line is Chromium's own derivation rather than a choice:
++//
++//   ui/base/pointer/pointer_device_default.cc:13-15  the no-touch pair is {FINE, HOVER}, and that
++//                                                    file is what macOS builds
++//   ui/base/pointer/pointer_device_win.cc:50-68      a touchscreen *adds* COARSE next to FINE; the
++//   ui/base/pointer/pointer_device_linux.cc:33-40    pointing device does not go away
++//   ui/base/pointer/pointer_device.cc:47-66          FINE wins the primary slot whenever present,
++//                                                    and HOVER likewise -- both are derived
++//
++// `touch_event_feature_detection_enabled` is deliberately **not** touched. It is `false` on every
++// desktop build regardless of hardware: `Update()` defaults the switch to
++// `kTouchEventFeatureDetectionDisabled` off Android and iOS, so `ontouchstart` is absent on this
++// 10-touch-point host exactly as it is on a Mac (measured on stock Chrome 151 in the same minute).
++// A pref that already agrees with the claim is not this patch's business.
++void ApplyInputPersona(blink::web_pref::WebPreferences* prefs) {
++  const std::optional<int> touch_points =
++      ungoogled::input_persona::EffectiveTouchPoints();
++  if (!touch_points.has_value()) {
++    return;
++  }
++  const bool has_touch = *touch_points > 0;
++  prefs->pointer_events_max_touch_points = *touch_points;
++  prefs->available_pointer_types =
++      has_touch ? (ui::POINTER_TYPE_COARSE | ui::POINTER_TYPE_FINE)
++                : ui::POINTER_TYPE_FINE;
++  prefs->primary_pointer_type = blink::mojom::PointerType::kPointerFineType;
++  prefs->available_hover_types = ui::HOVER_TYPE_HOVER;
++  prefs->primary_hover_type = blink::mojom::HoverType::kHoverHoverType;
++}
+ }  // namespace
+ 
+ SlowWebPreferenceCacheObserver::~SlowWebPreferenceCacheObserver() = default;
+@@ -115,6 +159,9 @@
+ #endif
+ 
+ #undef SET_FROM_CACHE
++
++  // Veil `961`: last, so the persona wins over the cached host values above.
++  ApplyInputPersona(prefs);
+ }
+ 
+ void SlowWebPreferenceCache::OnInputDeviceConfigurationChanged(uint8_t) {
