@@ -144,6 +144,13 @@ Present in this range today:
   is not a market fact about Apple but a property of what Chromium compiles. Takes the one switch this
   block needs, `--fingerprint-max-touch-points`, and nothing else from clearcote's `150`, which
   overrides the getter alone and leaves the media queries contradicting it.
+- `905-device-memory-switch` — corrects `005`, whose `deviceMemory()` body was `return 8;` gated on
+  nothing at all, so every profile reported 8 GB and no stored value could be honoured. Reads
+  `--fingerprint-device-memory` and falls back to the host's real `ApproximatedDeviceMemory` value — the
+  same two rungs `005` already gives `hardwareConcurrency`. clearcote's `030` was the audited counterpart
+  and is not the source: its middle rung is the persona struct, and both of its outer rungs clamp to 8
+  with the comment "real Chrome never reports >8", which Chromium 151 contradicts — `kMaxMemory` is 32
+  and stock Chrome reports 32 on the build host.
 
 ## Notes on licensing
 

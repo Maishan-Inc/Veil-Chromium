@@ -1,0 +1,237 @@
+# Origin:  none -- Veil-authored, and a correction rather than a new surface. clearcotelabs/
+#          clearcote-browser's `030-hardware-concurrency` was audited as the counterpart
+#          (Veil/docs/MIGRATION-UNGOOGLED.md 6.5, verdict `delta`) and is NOT the source: its
+#          `deviceMemory` body is a three-rung `flag > ungoogled::CurrentPersona() > real` ladder
+#          whose middle rung is the second identity source 6.9 rejected, and both of its outer rungs
+#          clamp to 8 with the comment "real Chrome never reports >8". That is false in Chromium 151
+#          and measurably so -- see below. What is taken is the argument that the field needs a
+#          switch at all.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# `005` replaced `NavigatorDeviceMemory::deviceMemory()`'s body with `return 8;`, gated on nothing --
+# not a switch, not the seed, not the platform (measured 5.1e). Two consequences, and the second is
+# the one that makes this a correction rather than a feature: every Veil profile reports the same 8,
+# which is a fleet-wide constant a detector can key on; and the `deviceMemory` field the UI stores
+# reaches nothing, so `fingerprintFieldState()` has had to call it *spoofed but not configurable*
+# since Stage 5.4. `905` gives it the switch, which moves it to *settable*.
+#
+# TWO RUNGS, THE SAME TWO `005` ALREADY GIVES ITS OTHER FIELD. `--fingerprint-device-memory=<n>`
+# first, then `ApproximatedDeviceMemory::GetApproximatedDeviceMemory()` -- the host's real value,
+# which is what `005` falls back to for `hardwareConcurrency` in the file next door. One rule for the
+# two fields of one block, and "unset" means the truth rather than a constant. No seed gate: a
+# declared RAM size is not a cross-platform substitution, so gating it on `--fingerprint` would
+# disable the field in exactly the case it is clearest.
+#
+# THE REACHABLE SET IS FIVE VALUES, AND THE COUNTERPART'S CLAMP IS AGAINST A STALE SPEC.
+# `approximated_device_memory.cc:33-79` rounds physical memory to the nearer neighbouring power of
+# two, divides by 1024, and clamps to `kMinMemory = 2.0f` / `kMaxMemory = 32.0f` on desktop -- 1 and 8
+# on Android -- citing crbug.com/454354290 for the update. So a desktop Chrome 151 can report exactly
+# 2, 4, 8, 16 or 32, and **stock Chrome 151 on this 32 GiB host reports 32** (measured 2026-08-28,
+# Veil/docs/MIGRATION-UNGOOGLED.md 6.18). clearcote's `> 8 -> 8` clamp therefore does not spec-cap
+# anything; it replaces a true value with a smaller one and calls the result the spec.
+#
+# A value outside the five **falls through to the host** rather than being clamped into it. Clamping
+# turns a typo into a different machine silently; falling through leaves the real value, which is the
+# direction `906` and `963` both take. Veil's `validate` refuses anything but the five, so a command
+# line carrying a sixth is hand-written and the engine's only duty is to not report an impossible
+# number.
+#
+# The switch **is** in `PropagateBrowserCommandLineToRenderer`'s allow-list, because
+# `NavigatorDeviceMemory` is Blink and a renderer has to see it. `961`, landing in the same phase, is
+# deliberately absent from that list for the mirror-image reason: the browser process is its only
+# reader. A switch is propagated when a process that reads it needs it, and not otherwise (6.9).
+#
+# SERIES POSITION. `905` corrects `005` and so must apply after it, but it is placed at the end of
+# `patches/series` rather than immediately after `005` -- the position `906` and `915` hold relative
+# to their targets. The reason is mechanical and worth stating rather than leaving as a puzzle: `961`
+# and `905` both append a constant to the tail of `components/ungoogled/ungoogled_switches.{h,cc}`,
+# so whichever applies second has to carry the first one's line in its context. `patches/series` is a
+# dependency order, not a numeric one -- `950` already sits before `012` in it for the same class of
+# reason.
+#
+# Veil-authored `9NN` numbering: `905` corrects the `005` of the same number, which is the convention
+# `906` and `915` follow.
+
+diff --git a/components/ungoogled/ungoogled_switches.cc b/components/ungoogled/ungoogled_switches.cc
+--- a/components/ungoogled/ungoogled_switches.cc
++++ b/components/ungoogled/ungoogled_switches.cc
+@@ -57,4 +57,9 @@
+ // PropagateBrowserCommandLineToRenderer's allow-list on purpose.
+ const char kFingerprintMaxTouchPoints[] = "fingerprint-max-touch-points";
+ 
++// Specify how much RAM the machine reports, in GB. Veil-authored, added by `905`: read in a renderer
++// (components/ungoogled/device_memory_persona.h, from Blink's NavigatorDeviceMemory), so unlike
++// `961`'s switch above this one is in PropagateBrowserCommandLineToRenderer's allow-list.
++const char kFingerprintDeviceMemory[] = "fingerprint-device-memory";
++
+ }  // namespace switches
+
+diff --git a/components/ungoogled/ungoogled_switches.h b/components/ungoogled/ungoogled_switches.h
+--- a/components/ungoogled/ungoogled_switches.h
++++ b/components/ungoogled/ungoogled_switches.h
+@@ -28,6 +28,7 @@
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintLocation[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintTimezone[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintMaxTouchPoints[];
++COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintDeviceMemory[];
+ }
+ 
+ #endif  // THIRD_PARTY_UNGOOGLED_FINGERPRINTING_SWITCHES_H_
+
+diff --git a/components/ungoogled/BUILD.gn b/components/ungoogled/BUILD.gn
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -5,6 +5,7 @@
+ component("ungoogled_switches") {
+   sources = [
+     "audio_persona.h",
++    "device_memory_persona.h",
+     "display_persona.h",
+     "fingerprint_data.h",
+     "font_persona.h",
+
+diff --git a/components/ungoogled/device_memory_persona.h b/components/ungoogled/device_memory_persona.h
+new file mode 100644
+index 0000000000..db5270a17e
+--- /dev/null
++++ b/components/ungoogled/device_memory_persona.h
+@@ -0,0 +1,87 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// How much RAM does the claimed machine have, and which values can a Chrome 151 actually report?
++//
++// `005` replaced `NavigatorDeviceMemory::deviceMemory()`'s body with `return 8;` -- no switch, no
++// seed, no fall-through -- so every Veil profile reported 8 GB and no stored value could be honoured
++// (measured, Veil/docs/MIGRATION-UNGOOGLED.md 5.1e). `905` is the correction: the switch is read
++// here, and "unset" means the host's real approximation, which is exactly what `005` already does
++// for `hardwareConcurrency` one file away. One rule for the two fields of one block.
++//
++// THE REACHABLE SET, and it is not the one the counterpart assumes.
++// `third_party/blink/public/common/device_memory/approximated_device_memory.cc:33-79` rounds the
++// host's physical memory to the *nearer* neighbouring power of two, divides by 1024 to get GB, and
++// then clamps -- and in Chromium 151 the clamp is `kMinMemory = 2.0f`, `kMaxMemory = 32.0f` on
++// desktop (1 and 8 on Android), with a comment citing crbug.com/454354290 for the update. So the
++// values a desktop Chrome 151 can report are exactly:
++//
++//     2, 4, 8, 16, 32
++//
++// Measured 2026-08-28: stock Chrome 151 on this 32 GiB host reports **32**. clearcote's `030` clamps
++// its result to 8 with the comment "real Chrome never reports >8"; that was true of an older
++// Chromium and is false of this one, and a persona reporting 8 where the modal desktop reports 16 or
++// 32 is a value chosen against a stale spec. This header takes the set from the file that computes
++// it instead.
++//
++// A value outside the set **falls through to the host** rather than being clamped into it. Clamping
++// would silently turn a typo into a different machine; falling through leaves the true value, which
++// is the same direction `906` and `963` take -- never invent, and prefer the host's truth to a guess.
++// Veil's own `validate` refuses anything but the five, so a command line carrying a sixth value is
++// hand-written and the engine's job is only to not report something impossible.
++//
++// The switch is declared in `ungoogled_switches` and **is** in
++// `RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer`'s allow-list, because unlike `961`'s
++// touch-point switch this one is read in a renderer: `NavigatorDeviceMemory` is Blink. The two
++// patches land in the same phase and answer that question differently on purpose -- a switch is
++// propagated when a process that reads it needs it, and not otherwise (6.9).
++
++#ifndef COMPONENTS_UNGOOGLED_DEVICE_MEMORY_PERSONA_H_
++#define COMPONENTS_UNGOOGLED_DEVICE_MEMORY_PERSONA_H_
++
++#include <optional>
++#include <string>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/ungoogled_switches.h"
++
++namespace ungoogled {
++namespace device_memory_persona {
++
++// The five values `ApproximatedDeviceMemory` can produce on a desktop build, smallest first. Kept as
++// an explicit list rather than a "power of two in [2, 32]" test so the set is readable at a glance
++// and so a future clamp change upstream shows up as a diff here rather than as a silent widening.
++inline constexpr float kReportableGb[] = {2.0f, 4.0f, 8.0f, 16.0f, 32.0f};
++
++// `--fingerprint-device-memory=<n>`, if present and one of the five. `std::nullopt` means "no usable
++// claim", and every caller's answer to that is the host's own value.
++//
++// Parsed as a double and compared exactly: the five are all small integers, so every one of them is
++// representable without rounding and an exact comparison is what makes "8.0" and "8" the same claim
++// while "6" is neither.
++inline std::optional<float> ClaimedGb() {
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line ||
++      !command_line->HasSwitch(::switches::kFingerprintDeviceMemory)) {
++    return std::nullopt;
++  }
++  double requested = 0;
++  if (!base::StringToDouble(command_line->GetSwitchValueASCII(
++                                ::switches::kFingerprintDeviceMemory),
++                            &requested)) {
++    return std::nullopt;
++  }
++  for (float reportable : kReportableGb) {
++    if (static_cast<double>(reportable) == requested) {
++      return reportable;
++    }
++  }
++  return std::nullopt;
++}
++
++}  // namespace device_memory_persona
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_DEVICE_MEMORY_PERSONA_H_
+
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3912,6 +3912,9 @@
+       switches::kFingerprintPlatformVersion,
+       switches::kFingerprintLocation,
+       switches::kFingerprintTimezone,
++      // Veil `905`. Read by Blink's NavigatorDeviceMemory, so a renderer needs it. `961`'s
++      // kFingerprintMaxTouchPoints is deliberately absent: the browser process is its only reader.
++      switches::kFingerprintDeviceMemory,
+       switches::kForceDeviceScaleFactor,
+       switches::kForceDisplayColorProfile,
+       switches::kForceHighContrast,
+
+diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+--- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
++++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator_device_memory.h"
+ 
++#include "components/ungoogled/device_memory_persona.h"
+ #include "third_party/blink/public/common/device_memory/approximated_device_memory.h"
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+@@ -12,8 +13,20 @@
+ namespace blink {
+ 
+ float NavigatorDeviceMemory::deviceMemory() const {
+-  return 8;
+-  // return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
++  // Veil `905` replaces `005`'s `return 8;`. The switch, then the host -- the same two rungs `005`
++  // gives `hardwareConcurrency` in navigator_concurrent_hardware.cc, and for the same reason: a
++  // value the user declared is the answer, and "unset" means the truth rather than a constant.
++  //
++  // No seed gate. A declared RAM size is not a cross-platform substitution, so gating it on
++  // `--fingerprint` would make the field unusable in exactly the case it is clearest -- a profile
++  // that spoofs nothing else but says how much memory the machine has.
++  //
++  // Which values are accepted, and why one outside the set falls through here instead of being
++  // clamped, is components/ungoogled/device_memory_persona.h.
++  if (std::optional<float> claimed = ungoogled::device_memory_persona::ClaimedGb()) {
++    return *claimed;
++  }
++  return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
+ }
+ 
+ }  // namespace blink
