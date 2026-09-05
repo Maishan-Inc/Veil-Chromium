@@ -46,3 +46,5 @@ veil/969-media-devices-and-codec-persona.patch
 veil/972-generic-families-and-local-fonts.patch
 veil/961-touch-and-pointer-persona.patch
 veil/905-device-memory-switch.patch
+veil/983-webrtc-ip-proxy-exit.patch
+veil/984-webrtc-mdns-hostnames.patch

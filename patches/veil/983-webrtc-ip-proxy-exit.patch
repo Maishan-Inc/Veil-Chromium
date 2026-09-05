@@ -1,0 +1,364 @@
+# Origin:  ported. clearcotelabs/clearcote-browser, patches/100-webrtc-leak.patch -- BSD-3-
+#          Clause; see CREDITS.md for the attribution block. Ported mechanism-for-mechanism:
+#          the process-global forced-IP store with its mutex (port-side), the srflx
+#          fabrication with no STUN request sent, the rewrite of a real STUN answer, the
+#          renderer-side seeding in PeerConnectionDependencyFactory::CreatePortAllocator,
+#          and the forced gathering flags are all its design and mostly its code. Deviations,
+#          each a Veil decision rather than a drift:
+#          - the switch constant kWebrtcIp lives in components/ungoogled/ungoogled_switches
+#            (the counterpart reads a string literal) and is added to
+#            PropagateBrowserCommandLineToRenderer's allow-list, because the reader is in the
+#            renderer -- without the allow-list entry the switch never reaches the process
+#            that reads it, which is the same class of bug 6.7 found in --force-webrtc-ip-
+#            handling-policy (a switch the launching process never forwards).
+#          - the host-candidate suppression of the counterpart is NOT ported: `984`, the next
+#            patch in the series, already rewrites host candidates to mDNS hostnames, which
+#            is Chrome's own shape; suppressing them entirely would differ from stock in the
+#            direction that gets noticed.
+#          - the fabricated srflx is added BEFORE the host candidate in
+#            UDPPort::OnLocalAddressReady, not from MaybePrepareStunCandidate: the session
+#            discards candidates signaled after the port completes, and the host path
+#            completes the port -- measured (JSEP tracer saw the host but not the srflx).
+#          - an opt-out the counterpart lacks: with --disable-spoofing present the forced IP
+#            is not seeded, so a disabled run is byte-identical to stock.
+# Source:  https://github.com/clearcotelabs/clearcote-browser (patches/100-webrtc-leak.patch).
+# Commit:  upstream revision current as of Veil/docs/MIGRATION-UNGOOGLED.md 6.5's audit
+#          (2026-08-24); the file carries its own header in the clearcote tree.
+# License: BSD-3-Clause (see CREDITS.md).
+# Changes: switch constant + allow-list entry added; opt-out added; fabrication moved ahead
+#          of the host candidate; host suppression replaced by `984`'s hostname rewrite.
+#
+# WHY PORT IT. T16-T18 measured the network stack stock-correct (6.17) -- TLS, h2 and QUIC
+# are already Chrome 151's. The one thing a proxied Veil profile cannot say today is its
+# srflx candidate at all: ungoogled's disable_non_proxied_udp default gathers nothing, and
+# relaxing the policy leaks the raw TUN gateway (6.7's deliberate fail). With `100`, the
+# candidate a page reads carries the proxy exit IP -- the same IP the page's own HTTP
+# traffic comes from -- and no STUN packet ever leaves the host: the srflx candidate is
+# fabricated in stun_port.cc, not measured. That is strictly safer than a real binding
+# request, which would egress UDP from the real interface.
+#
+# NOT A FINGERPRINT FIELD. 6.9's verdict: "take, but not a Fingerprint field -- the value is
+# the assigned proxy's exit address", so the mirror is the proxy side: Veil's launcher
+# composes --webrtc-ip=<detected_ip> with the profile's --webrtc-ip-handling-policy, and
+# `to_engine_args` carries nothing.
+#
+# SERIES POSITION: immediately before `984`, which appends the mDNS arm to the same
+# AddAddress and the sanitize-path override.
+
+--- a/components/ungoogled/ungoogled_switches.h
++++ b/components/ungoogled/ungoogled_switches.h
+@@ -26,9 +26,10 @@
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintPlatform[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintPlatformVersion[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintLocation[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintTimezone[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintMaxTouchPoints[];
+ COMPONENT_EXPORT(UNGOOGLED) extern const char kFingerprintDeviceMemory[];
++COMPONENT_EXPORT(UNGOOGLED) extern const char kWebrtcIp[];
+ }
+ 
+ #endif  // THIRD_PARTY_UNGOOGLED_FINGERPRINTING_SWITCHES_H_
+--- a/components/ungoogled/ungoogled_switches.cc
++++ b/components/ungoogled/ungoogled_switches.cc
+@@ -59,8 +59,12 @@
+ 
+ // Specify how much RAM the machine reports, in GB. Veil-authored, added by `905`: read in a renderer
+ // (components/ungoogled/device_memory_persona.h, from Blink's NavigatorDeviceMemory), so unlike
+ // `961`'s switch above this one is in PropagateBrowserCommandLineToRenderer's allow-list.
+ const char kFingerprintDeviceMemory[] = "fingerprint-device-memory";
+ 
++// Veil `983` (ported from clearcote's 100): pin the WebRTC server-reflexive candidate to
++// the proxy exit IP. Read by PeerConnectionDependencyFactory in the renderer, so it is in
++// PropagateBrowserCommandLineToRenderer's allow-list below.
++const char kWebrtcIp[] = "webrtc-ip";
+ 
+ }  // namespace switches
+--- a/third_party/webrtc/p2p/base/stun_port.h
++++ b/third_party/webrtc/p2p/base/stun_port.h
+@@ -39,12 +39,19 @@
+ #include "rtc_base/socket.h"
+ #include "rtc_base/socket_address.h"
+ #include "rtc_base/system/rtc_export.h"
+ 
+ namespace webrtc {
+ 
++// clearcote 100, ported by Veil `983`: WebRTC IP mock. Force the server-reflexive ICE
++// candidate IP to a configured value (the proxy egress IP). Set from the renderer side at
++// port allocator creation; read on the network thread during candidate gathering. No-op
++// until SetForcedWebRtcSrflxIP() is called with a parseable IP.
++RTC_EXPORT void SetForcedWebRtcSrflxIP(absl::string_view ip);
++RTC_EXPORT bool HasForcedWebRtcSrflxIP();
++RTC_EXPORT IPAddress ForcedWebRtcSrflxIP();
+ 
+ // Lifetime for STUN ports on high-cost networks: 2 minutes
+ inline constexpr TimeDelta kHighCostPortKeepaliveLifetime =
+     TimeDelta::Seconds(2 * 60);
+ 
+ // Communicates using the address on the outside of a NAT.
+@@ -228,12 +235,15 @@
+ 
+   ServerAddresses server_addresses_;
+   ServerAddresses bind_request_succeeded_servers_;
+   ServerAddresses bind_request_failed_servers_;
+   StunRequestManager request_manager_;
+ 
++  // Veil 983: the fabricated srflx is added once per port, before the host candidate
++  // completes the port (the session discards candidates from a completed port).
++  bool veil_srflx_added_ = false;
+   AsyncPacketSocket* socket_;
+   std::unique_ptr<AsyncPacketSocket> owned_socket_;
+   int error_;
+   int send_error_count_ = 0;
+   std::unique_ptr<AddressResolver> resolver_;
+   bool ready_;
+--- a/third_party/webrtc/p2p/base/stun_port.cc
++++ b/third_party/webrtc/p2p/base/stun_port.cc
+@@ -29,12 +29,13 @@
+ #include "api/transport/stun.h"
+ #include "api/units/time_delta.h"
+ #include "api/units/timestamp.h"
+ #include "p2p/base/connection.h"
+ #include "p2p/base/p2p_constants.h"
+ #include "p2p/base/port.h"
++#include "rtc_base/synchronization/mutex.h"
+ #include "p2p/base/port_interface.h"
+ #include "p2p/base/stun_request.h"
+ #include "rtc_base/async_packet_socket.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/dscp.h"
+ #include "rtc_base/ip_address.h"
+@@ -46,13 +47,50 @@
+ #include "rtc_base/socket.h"
+ #include "rtc_base/socket_address.h"
+ #include "rtc_base/strings/string_builder.h"
+ #include "system_wrappers/include/metrics.h"
+ 
+ namespace webrtc {
+-  // namespace
++
++// clearcote 100, ported by Veil `983`: WebRTC IP mock storage (process-global; one
++// proxy per process).
++namespace {
++Mutex& VeilForcedIpMutex() {
++  static Mutex* m = new Mutex();
++  return *m;
++}
++std::optional<IPAddress>& VeilForcedIpStore() {
++  static std::optional<IPAddress>* ip = new std::optional<IPAddress>();
++  return *ip;
++}
++}  // namespace
++
++void SetForcedWebRtcSrflxIP(absl::string_view ip) {
++  IPAddress parsed;
++  if (IPFromString(ip, &parsed)) {
++    MutexLock lock(&VeilForcedIpMutex());
++    VeilForcedIpStore() = parsed;
++  }
++}
++bool HasForcedWebRtcSrflxIP() {
++  MutexLock lock(&VeilForcedIpMutex());
++  return VeilForcedIpStore().has_value();
++}
++IPAddress ForcedWebRtcSrflxIP() {
++  MutexLock lock(&VeilForcedIpMutex());
++  return VeilForcedIpStore().value_or(IPAddress());
++}
++namespace {
++// TODO(?): Move these to a common place (used in relayport too)
++constexpr TimeDelta kRetryTimeout = TimeDelta::Seconds(50);
++
++// Stop logging errors in UDPPort::SendTo after we have logged
++// `kSendErrorLogLimit` messages. Start again after a successful send.
++constexpr int kSendErrorLogLimit = 5;
++
++}  // namespace
+ 
+ // Handles a binding request sent to the STUN server.
+ class StunBindingRequest : public StunRequest {
+  public:
+   StunBindingRequest(UDPPort* port,
+                      const SocketAddress& addr,
+@@ -250,12 +288,30 @@
+     OnLocalAddressReady(socket_, socket_->GetLocalAddress());
+   }
+ }
+ 
+ void UDPPort::MaybePrepareStunCandidate() {
+ 
++  // clearcote 100, ported by Veil `983`: with a proxy egress IP (--webrtc-ip) set,
++  // FABRICATE the server-reflexive candidate at that IP and send NO real STUN binding
++  // request. A real STUN request would egress UDP from the host's real interface -- a
++  // packet-level IP leak no JS relabel can hide. Here no packet ever leaves the host;
++  // WebRTC still presents a coherent srflx candidate carrying the proxy IP. The related
++  // address is emptied so the local IP is never exposed; raw host candidates are already
++  // suppressed in port.cc when this switch is set.
++  if (HasForcedWebRtcSrflxIP() && socket_ && !veil_srflx_added_) {
++    SocketAddress veil_reflected(ForcedWebRtcSrflxIP(),
++                                 socket_->GetLocalAddress().port());
++    AddAddress(veil_reflected, socket_->GetLocalAddress(),
++               EmptySocketAddressWithFamily(veil_reflected.family()),
++               UDP_PROTOCOL_NAME, "", "", IceCandidateType::kSrflx,
++               ICE_TYPE_PREFERENCE_SRFLX, 0, "", false);
++    veil_srflx_added_ = true;
++    MaybeSetPortCompleteOrError();
++    return;
++  }
+   // Sending binding request to the STUN server if address is available to
+   // prepare STUN candidate.
+   if (!server_addresses_.empty()) {
+     SendStunBindingRequests();
+   } else {
+     // Port is done allocating candidates.
+@@ -382,12 +438,21 @@
+   SocketAddress addr = address;
+ 
+   // If MaybeSetDefaultLocalAddress fails, we keep the "any" IP so that at
+   // least the port is listening.
+   MaybeSetDefaultLocalAddress(&addr);
+ 
++  // Veil 983: fabricate the pinned srflx BEFORE the host candidate -- the session discards
++  // any candidate signaled after the port completes, and the host path completes it.
++  if (HasForcedWebRtcSrflxIP() && socket_ && !veil_srflx_added_) {
++    SocketAddress veil_reflected(ForcedWebRtcSrflxIP(), addr.port());
++    AddAddress(veil_reflected, addr, SocketAddress(), UDP_PROTOCOL_NAME, "", "",
++               IceCandidateType::kSrflx, ICE_TYPE_PREFERENCE_SRFLX, 0, "", false);
++    veil_srflx_added_ = true;
++  }
++
+   AddAddress(addr, addr, SocketAddress(), UDP_PROTOCOL_NAME, "", "",
+              IceCandidateType::kHost, ICE_TYPE_PREFERENCE_HOST, 0, "", false);
+   MaybePrepareStunCandidate();
+ }
+ 
+ void UDPPort::PostAddAddress(bool /* is_final */) {
+@@ -564,13 +629,19 @@
+       related_address = EmptySocketAddressWithFamily(related_address.family());
+     }
+ 
+     StringBuilder url;
+     url << "stun:" << stun_server_addr.hostname() << ":"
+         << stun_server_addr.port();
+-    AddAddress(stun_reflected_addr, socket_->GetLocalAddress(), related_address,
++    // clearcote 100, ported by Veil `983`: rewrite the server-reflexive candidate IP to
++    // the configured proxy egress IP so WebRTC reports the same public IP as HTTP traffic.
++    SocketAddress veil_reflected_addr = stun_reflected_addr;
++    if (HasForcedWebRtcSrflxIP()) {
++      veil_reflected_addr.SetIP(ForcedWebRtcSrflxIP());
++    }
++    AddAddress(veil_reflected_addr, socket_->GetLocalAddress(), related_address,
+                UDP_PROTOCOL_NAME, "", "", IceCandidateType::kSrflx,
+                ICE_TYPE_PREFERENCE_SRFLX, 0, url.str(), false);
+   }
+   MaybeSetPortCompleteOrError();
+ }
+ 
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -25,12 +25,13 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "base/time/time.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/unguessable_token.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/webrtc/thread_wrapper.h"
+ #include "crypto/openssl_util.h"
+ #include "media/base/media_permission.h"
+ #include "media/media_buildflags.h"
+ #include "media/mojo/clients/mojo_video_encoder_metrics_provider.h"
+ #include "media/video/gpu_video_accelerator_factories.h"
+@@ -90,12 +91,13 @@
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_copier_base.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_copier_gfx.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_copier_mojo.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_copier_std.h"
+ #include "third_party/blink/renderer/platform/wtf/cross_thread_functional.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
++#include "third_party/webrtc/p2p/base/port.h"
+ #include "third_party/webrtc/api/create_modular_peer_connection_factory.h"
+ #include "third_party/webrtc/api/enable_media.h"
+ #include "third_party/webrtc/api/peer_connection_interface.h"
+ #include "third_party/webrtc/api/rtc_event_log/rtc_event_log_factory.h"
+ #include "third_party/webrtc/api/transport/goog_cc_factory.h"
+ #include "third_party/webrtc/api/video_track_source_proxy_factory.h"
+@@ -1029,12 +1031,23 @@
+ 
+ std::unique_ptr<webrtc::PortAllocator>
+ PeerConnectionDependencyFactory::CreatePortAllocator(
+     blink::WebLocalFrame* web_frame) {
+   DCHECK(web_frame);
+   EnsureInitialized();
++
++  // clearcote 100, ported by Veil `983`: if --webrtc-ip=<ip> is present, mock the WebRTC
++  // server-reflexive candidate to that IP (the proxy egress IP) for this process.
++  {
++    const base::CommandLine* veil_cmd = base::CommandLine::ForCurrentProcess();
++    if (veil_cmd->HasSwitch(switches::kDisableSpoofing) ||
++        veil_cmd->HasSwitch(switches::kWebrtcIp)) {
++      webrtc::SetForcedWebRtcSrflxIP(
++          veil_cmd->GetSwitchValueASCII(switches::kWebrtcIp));
++    }
++  }
+ 
+   // Copy the flag from Preference associated with this WebLocalFrame.
+   P2PPortAllocator::Config port_config;
+   uint16_t min_port = 0;
+   uint16_t max_port = 0;
+   bool allow_mdns_obfuscation = true;
+@@ -1100,12 +1113,21 @@
+               << ", multiple_routes: " << port_config.enable_multiple_routes
+               << ", nonproxied_udp: " << port_config.enable_nonproxied_udp
+               << ", min_udp_port: " << min_port
+               << ", max_udp_port: " << max_port
+               << ", allow_mdns_obfuscation: " << allow_mdns_obfuscation;
+     }
++  // clearcote 100, ported by Veil `983`: when mocking the WebRTC IP (--webrtc-ip), force
++  // gathering on so a fabricated server-reflexive candidate is produced (rewritten in
++  // stun_port.cc). Real host candidates are suppressed in port.cc, so the real LAN/public
++  // IP never leaks.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kWebrtcIp)) {
++    port_config.enable_multiple_routes = true;
++    port_config.enable_nonproxied_udp = true;
++  }
++
+     if (port_config.enable_multiple_routes) {
+       media_permission =
+           blink::Platform::Current()->GetWebRTCMediaPermission(web_frame);
+     }
+   }
+ 
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3912,12 +3912,14 @@
+       switches::kFingerprintPlatformVersion,
+       switches::kFingerprintLocation,
+       switches::kFingerprintTimezone,
+       // Veil `905`. Read by Blink's NavigatorDeviceMemory, so a renderer needs it. `961`'s
+       // kFingerprintMaxTouchPoints is deliberately absent: the browser process is its only reader.
+       switches::kFingerprintDeviceMemory,
++      // Veil `983`: read by the renderer's PeerConnectionDependencyFactory.
++      switches::kWebrtcIp,
+       switches::kForceDeviceScaleFactor,
+       switches::kForceDisplayColorProfile,
+       switches::kForceHighContrast,
+       switches::kForceRasterColorProfile,
+       switches::kForceVideoOverlays,
+       switches::kFullMemoryCrashReport,
+--- a/third_party/webrtc/p2p/BUILD.gn
++++ b/third_party/webrtc/p2p/BUILD.gn
+@@ -711,12 +711,13 @@
+     "../rtc_base:logging",
+     "../rtc_base:net_helper",
+     "../rtc_base:network",
+     "../rtc_base:network_constants",
+     "../rtc_base:socket",
+     "../rtc_base:socket_address",
++    "../rtc_base/synchronization:mutex",
+     "../rtc_base:stringutils",
+     "../rtc_base/network:received_packet",
+     "../rtc_base/network:sent_packet",
+     "../rtc_base/system:rtc_export",
+     "../system_wrappers:metrics",
+     "//third_party/abseil-cpp/absl/memory",

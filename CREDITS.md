@@ -74,6 +74,13 @@ grid genuine Chrome can produce (`967`). Their persona-struct rung and their tab
 the device list is deliberately **not** taken, because `getUserMedia()` resolves out of the same
 enumeration (6.15).
 
+Stage 6's T19 ports **`100-webrtc-leak`** as Veil's `983`: the fabricated server-reflexive
+candidate pinned to the proxy exit IP (`--webrtc-ip=`), with the srflx rewrite, the forced
+gathering, and the process-global forced-IP store. The host-candidate suppression of the
+counterpart is replaced by Veil's `984` (the next patch in the series), which turns host
+candidates into synthetic mDNS hostnames instead — Chrome's own shape — and adds an opt-out the
+counterpart lacks.
+
 ## Brave
 
 [Brave Browser][brave] — MPL-2.0.

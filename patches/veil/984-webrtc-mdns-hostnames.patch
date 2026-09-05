@@ -1,0 +1,306 @@
+# Origin:  none -- Veil-authored. clearcotelabs/clearcote-browser has no counterpart for this
+#          surface (Veil/docs/MIGRATION-UNGOOGLED.md 6.5: `984` is one of the eight patches with
+#          none at all), and the mechanism deliberately differs from Chromium's own -- the header
+#          below is the argument for that difference.
+# Source:  n/a -- authored in this repository.
+# Commit:  n/a -- see this repository's git log for this file.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: n/a -- not a port.
+#
+# WHAT AND WHY. Stock Chrome 151, asked for ICE candidates with no STUN servers, answers with a
+# host candidate whose address is a random UUID hostname -- `<uuid>.local`, RFC 6762/6763 mDNS
+# concealment, feature kWebRtcHideLocalIpsWithMdns (enabled by default,
+# third_party/blink/common/features.cc:2746). This engine answers with the raw address --
+# measured on the shipping 1001 binary: one host candidate, `198.18.0.1` in the clear where
+# Chrome shows `<uuid>.local` (Veil/docs/MIGRATION-UNGOOGLED.md 6.7, filed there as T03's
+# "Cause 3"). Two tells in one: a Chrome-branded UA that can never produce a `.local` candidate
+# is itself a population-distribution tell; and any policy that does gather host candidates
+# leaks an address Chrome would have hidden.
+#
+# WHY NOT THE GN ARG. The upstream mechanism is a buildflag: ungoogled-chromium's flags.gn sets
+# enable_mdns=false and the tree compiles the responder out -- MdnsResponderAdapter is
+# constructed behind `BUILDFLAG(ENABLE_MDNS)` (peer_connection_dependency_factory.cc:774),
+# NetworkContext::CreateMdnsResponder is NOTREACHED without it (network_context.cc:2626), and
+# services/network plus net/dns drop mdns_responder.cc / mdns_client*.cc from their sources
+# lists. Restoring the arg compiles ~10 files back in and re-enables chrome/browser/
+# local_discovery with it (chrome/common/features.gni:65 wires enable_service_discovery straight
+# off enable_mdns). And the responder is not just an obfuscator: MdnsResponder::
+# CreateNameForAddress sends real mDNS ANNOUNCE packets on every network interface -- two per
+# name, RFC 6762 s.8.3 (services/network/mdns_responder.cc:1190-1233) --
+# MdnsResponderManager::StartIfNeeded binds a UDP 5353 server socket per interface
+# (mdns_responder.cc:849), and the service answers multicast queries and probe/conflict
+# detection. For a local-first fingerprint browser that is new background networking and a new
+# machine-shaped surface (the name-generator TXT record enumerates every name in use), all to
+# obtain a string a page can never check by resolving -- the harness says as much:
+# `webrtc.candidates.*.addressSha256` is excluded from assertion 2 because Chromium randomises
+# these hostnames per session and origin, so the VALUE is not the fingerprint; the CLASS is.
+#
+# WHAT THIS DOES INSTEAD. Same observable, none of the machinery. `Port::AddAddress` -- the one
+# door every host candidate walks through -- intercepts local candidates and rewrites the
+# address to a synthetic `<uuid>.local` hostname. The uuid comes from webrtc's own
+# `CreateRandomUuid` (rtc_base/crypto_random.h), the generator the real responder's
+# RandomUuidNameGenerator uses (mdns_responder.cc:109); the `.local` suffix is the same
+# LOCAL_TLD stock Chrome's candidates carry (p2p_constants.h:54). Names are memoised per
+# process: stable per address for the process' lifetime -- a page sees the same name across
+# re-gathers, as the responder's refcounted names give -- and fresh per launch, so no
+# cross-session correlation. `related_address` is emptied exactly as MaybeObfuscateAddress's
+# callback does (port.cc:276, `copy.set_related_address(SocketAddress())`), because a hostname
+# candidate with the raw IP in raddr is the leak wearing a disguise.
+#
+# TWO HALVES, ONE PATCH. The hostname rewrite alone is not enough: the session's sanitize path
+# re-derives the address at signaling time. PortAllocator::SanitizeCandidate
+# (port_allocator.cc:315) computes `use_hostname_address = (is_local || is_prflx) &&
+# MdnsObfuscationEnabled()`, and BasicPortAllocator::MdnsObfuscationEnabled()
+# (basic_port_allocator.cc:544) is `responder != nullptr` -- always false on this build, so
+# `Candidate::ToSanitizedCopy` (api/candidate.cc:501) keeps the resolved IP and
+# `BuildCandidate` (api/candidate.cc:74) prints it, undoing the rewrite one layer down.
+# Measured, not guessed: with only the rewrite applied, a live gather still reported
+# `198.18.0.1`. The fix is the second hunk: `MdnsObfuscationEnabled()` returns true while the
+# spoof is active, so the sanitize path switches host candidates to their hostname and filters
+# related addresses exactly as stock Chrome's does -- including the srflx raddr, which stock
+# also clears under mDNS (Chrome shows `raddr 0.0.0.0 rport 0`).
+#
+# The candidate stays honest to the ICE state machine: the address keeps its resolved IP
+# (`hostname_address.SetResolvedIP(real_ip)`, the same split MaybeObfuscateAddress's callback
+# produces at port.cc:272-275), so connectivity checks still work if ICE actually uses the
+# candidate; a page that merely READS candidates sees what stock Chrome shows.
+#
+# GATING. `--disable-spoofing=webrtc` is the opt-out, the same family as `006`'s `=font` and
+# `963`'s `=gpu`: `VeilWebrtcSpoofEnabled()` (port.cc, exported for the allocator's sanitize
+# path) reads the browser-side process' command line, and a disabled flag leaves every path
+# byte-identical to stock. No new switch constant is added -- the flag exists already, declared
+# with `000`'s set (kDisableSpoofing) -- and it is read on the network thread of the process
+# that owns the webrtc stack only, so nothing goes into
+# PropagateBrowserCommandLineToRenderer's allow-list -- the same call `961` made for its
+# browser-side switch.
+#
+# SERIES POSITION: immediately after `983`. The `984` build dep (`p2p/BUILD.gn`, port target)
+# adds `rtc_base/synchronization:mutex` for the memoised names' lock and
+# `//components/ungoogled:ungoogled_switches` for kDisableSpoofing; the same file's stun_port
+# target gains the mutex dep in `983`, which is why `983` must apply first.
+#
+# Acceptance (T19, Veil/docs/STAGE-6-FULL-COVERAGE.md 5): a host candidate is an mDNS hostname
+# or is absent; assertion 4 stays `pass` on the two committed cases and its deliberate `fail`
+# keeps its verdict; the fingerprint surface moves on the ip-default control and nothing else.
+
+--- a/third_party/webrtc/p2p/base/port.h
++++ b/third_party/webrtc/p2p/base/port.h
+@@ -48,12 +48,16 @@
+ #include "rtc_base/system/rtc_export.h"
+ #include "rtc_base/thread_annotations.h"
+ #include "rtc_base/weak_ptr.h"
+ 
+ namespace webrtc {
+ 
++// Veil 984: true unless --disable-spoofing includes the webrtc group. Drives both the
++// synthetic .local hostnames in Port::AddAddress and the sanitize path below.
++RTC_EXPORT bool VeilWebrtcSpoofEnabled();
++
+ enum class MdnsNameRegistrationStatus {
+   // IP concealment with mDNS is not enabled or the name registration process is
+   // not started yet.
+   kNotStarted,
+   // A request to create and register an mDNS name for a local IP address of a
+   // host candidate is sent to the mDNS responder.
+@@ -455,12 +459,26 @@
+                   absl::string_view tcptype,
+                   IceCandidateType type,
+                   uint32_t type_preference,
+                   uint32_t relay_preference,
+                   absl::string_view url,
+                   bool is_final);
++
++  // Veil 984: the un-rewritten body of AddAddress, called with the original arguments
++  // when the candidate is not a local host candidate or the spoof is disabled.
++  void AddAddressInternal(const SocketAddress& address,
++                          const SocketAddress& base_address,
++                          const SocketAddress& related_address,
++                          absl::string_view protocol,
++                          absl::string_view relay_protocol,
++                          absl::string_view tcptype,
++                          IceCandidateType type,
++                          uint32_t type_preference,
++                          uint32_t relay_preference,
++                          absl::string_view url,
++                          bool is_final) RTC_RUN_ON(thread_);
+ 
+   void FinishAddingAddress(const Candidate& c, bool is_final)
+       RTC_RUN_ON(thread_);
+ 
+   virtual void PostAddAddress(bool is_final);
+ 
+--- a/third_party/webrtc/p2p/base/port.cc
++++ b/third_party/webrtc/p2p/base/port.cc
+@@ -14,30 +14,34 @@
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <map>
+ #include <utility>
+ #include <vector>
+ 
+ #include "absl/algorithm/container.h"
+ #include "absl/functional/any_invocable.h"
++#include "absl/base/no_destructor.h"
+ #include "absl/memory/memory.h"
+ #include "absl/strings/string_view.h"
+ #include "api/candidate.h"
+ #include "api/local_network_access_permission.h"
+ #include "api/sequence_checker.h"
+ #include "api/task_queue/task_queue_base.h"
+ #include "api/transport/stun.h"
+ #include "api/units/time_delta.h"
++#include "base/command_line.h"
+ #include "p2p/base/connection.h"
+ #include "p2p/base/p2p_constants.h"
+ #include "p2p/base/port_interface.h"
+ #include "p2p/base/stun_request.h"
+ #include "p2p/base/transport_description.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "rtc_base/async_packet_socket.h"
+ #include "rtc_base/byte_buffer.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/crypto_random.h"
+ #include "rtc_base/dscp.h"
+ #include "rtc_base/ip_address.h"
+@@ -48,15 +52,47 @@
+ #include "rtc_base/network.h"
+ #include "rtc_base/network/received_packet.h"
+ #include "rtc_base/network/sent_packet.h"
+ #include "rtc_base/socket_address.h"
+ #include "rtc_base/string_encode.h"
+ #include "rtc_base/string_utils.h"
++#include "rtc_base/synchronization/mutex.h"
+ #include "rtc_base/strings/string_builder.h"
+ #include "rtc_base/trace_event.h"
+ #include "rtc_base/weak_ptr.h"
++
++namespace webrtc {
++// Veil 984 -- synthetic mDNS hostnames.
++//
++// Stock Chrome answers a STUN-less gather with `<uuid>.local`; this engine, built with
++// enable_mdns=false, answers with the raw address (see the patch header for why the full
++// mDNS responder is not restored). Names are memoised per process: stable per address,
++// fresh per launch. AddAddress runs on the network thread; the mutex covers the
++// allocator-session threads that may race the first gather.
++namespace {
++std::string VeilMdnsNameFor(const IPAddress& ip) {
++  static absl::NoDestructor<std::map<IPAddress, std::string>> names;
++  static absl::NoDestructor<Mutex> mutex;
++  MutexLock lock(mutex.get());
++  auto it = names->find(ip);
++  if (it != names->end()) {
++    return it->second;
++  }
++  std::string name = CreateRandomUuid() + LOCAL_TLD;
++  names->emplace(ip, name);
++  return name;
++}
++}  // namespace
++
++bool VeilWebrtcSpoofEnabled() {
++  const base::CommandLine* veil_cmd = base::CommandLine::ForCurrentProcess();
++  return !(veil_cmd->HasSwitch(switches::kDisableSpoofing) &&
++           veil_cmd->GetSwitchValueASCII(switches::kDisableSpoofing)
++               .find("webrtc") != std::string::npos);
++}
++
+ namespace {
+ 
+ PacketInfoProtocolType ConvertProtocolTypeToPacketInfoProtocolType(
+     ProtocolType type) {
+   switch (type) {
+     case ProtocolType::PROTO_UDP:
+@@ -213,12 +249,48 @@
+                       uint32_t type_preference,
+                       uint32_t relay_preference,
+                       absl::string_view url,
+                       bool is_final) {
+   RTC_DCHECK_RUN_ON(thread_);
+ 
++  // Veil 984: local host candidates carry a synthetic .local hostname, as stock Chrome's
++  // mDNS-obfuscated candidates do. `--disable-spoofing=webrtc` restores the raw address.
++  if (type == IceCandidateType::kHost && VeilWebrtcSpoofEnabled()) {
++    const IPAddress real_ip = address.ipaddr();
++    std::string name = VeilMdnsNameFor(real_ip);
++    Candidate c(component_, protocol, address, 0U, username_fragment(),
++                password_, type, generation_, "", network_->id(),
++                network_cost_);
++    // Hostname and resolved IP kept apart, exactly the shape MaybeObfuscateAddress's
++    // callback produces: the address string is the name, the resolved address stays for
++    // ICE.
++    SocketAddress hostname_address(name, address.port());
++    hostname_address.SetResolvedIP(real_ip);
++    c.set_address(hostname_address);
++    c.set_related_address(SocketAddress());
++    FinishAddingAddress(c, is_final);
++    return;
++  }
++  AddAddressInternal(address, base_address, related_address, protocol,
++                     relay_protocol, tcptype, type, type_preference,
++                     relay_preference, url, is_final);
++}
++
++void Port::AddAddressInternal(const SocketAddress& address,
++                      const SocketAddress& base_address,
++                      const SocketAddress& related_address,
++                      absl::string_view protocol,
++                      absl::string_view relay_protocol,
++                      absl::string_view tcptype,
++                      IceCandidateType type,
++                      uint32_t type_preference,
++                      uint32_t relay_preference,
++                      absl::string_view url,
++                      bool is_final) {
++  RTC_DCHECK_RUN_ON(thread_);
++
+   // TODO(tommi): Set relay_protocol and optionally provide the base address
+   // to automatically compute the foundation in the ctor? It would be a good
+   // thing for the Candidate class to know the base address and keep it const.
+   Candidate c(component_, protocol, address, 0U, username_fragment(), password_,
+               type, generation_, "", network_->id(), network_cost_);
+   // Set the relay protocol before computing the foundation field.
+--- a/third_party/webrtc/p2p/client/basic_port_allocator.cc
++++ b/third_party/webrtc/p2p/client/basic_port_allocator.cc
+@@ -539,12 +539,21 @@
+     }
+     candidates->push_back(allocator_->SanitizeCandidate(candidate));
+   }
+ }
+ 
+ bool BasicPortAllocator::MdnsObfuscationEnabled() const {
++  // Veil 984: this engine builds with enable_mdns=false, so the responder is always null
++  // and the stock check would report obfuscation off -- which makes SanitizeCandidate keep
++  // the resolved IP and BuildCandidate print it, undoing the synthetic .local hostname
++  // Port::AddAddress installed. Report obfuscation on when 984 is active; the sanitize path
++  // then switches host candidates to their hostname and filters related addresses exactly
++  // as stock Chrome's does.
++  if (webrtc::VeilWebrtcSpoofEnabled()) {
++    return true;
++  }
+   return network_manager()->GetMdnsResponder() != nullptr;
+ }
+ 
+ bool BasicPortAllocatorSession::CandidatesAllocationDone() const {
+   RTC_DCHECK_RUN_ON(network_thread_);
+   // Done only if all required AllocationSequence objects
+--- a/third_party/webrtc/p2p/BUILD.gn
++++ b/third_party/webrtc/p2p/BUILD.gn
+@@ -573,12 +573,14 @@
+     "../rtc_base:span_helpers",
+     "../rtc_base:stringutils",
+     "../rtc_base:weak_ptr",
+     "../rtc_base/network:received_packet",
+     "../rtc_base/network:sent_packet",
+     "../rtc_base/system:rtc_export",
++    "../rtc_base/synchronization:mutex",
++    "//components/ungoogled:ungoogled_switches",
+     "//third_party/abseil-cpp/absl/algorithm:container",
+     "//third_party/abseil-cpp/absl/functional:any_invocable",
+     "//third_party/abseil-cpp/absl/memory",
+     "//third_party/abseil-cpp/absl/strings",
+     "//third_party/abseil-cpp/absl/strings:string_view",
+   ]
