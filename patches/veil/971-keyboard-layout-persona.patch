@@ -1,0 +1,247 @@
+# Origin:  clearcotelabs/clearcote-browser -- the surface, not the code.
+# Source:  patches/150-device-sensors.patch (its getLayoutMap hunk)
+# Commit:  clearcote-browser-main tarball, audited 2026-08-24 (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: re-authored, and the premise corrected. `150` answers every locale with one pinned
+#          US-QWERTY map -- the task's own audit called that out (6.5): "returns one pinned
+#          US-QWERTY map, so 'follows the claimed locale' is still authoring". What Veil takes is
+#          the hook point and the problem statement; the per-locale tables, the locale selection
+#          and the absent-key erase are Veil's. `150` also rewrites the map from the persona struct
+#          (6.9: not taken -- one identity, one source); the selection here is `--lang`, the same
+#          switch `972`'s generic families and `968`'s default voice follow, so the locale names
+#          one set of OS-configured answers and not two.
+#
+# Veil-authored `9NN` numbering: `971` has no `071` to correct; `950`-`999` are Veil-authored with
+# no counterpart.
+#
+# ---------------------------------------------------------------------------------------------
+#
+# Where the host keyboard leaks, and where it is answered from.
+#
+# `navigator.keyboard.getLayoutMap()` travels renderer -> mojo -> `RenderWidgetHostImpl` ->
+# `RenderWidgetHostViewAura` -> `aura::WindowTreeHost` -> `ui::GenerateDomKeyboardLayoutMap()`,
+# whose Windows implementation asks `ToUnicodeEx` about the *host's* installed layouts. Every
+# persona therefore reported the build host's own 48-key US map (measured, 6.22) -- a macOS persona
+# that was never near a US keyboard. The rewrite sits at the chrome-path choke point
+# (`RenderWidgetHostViewAura::GetKeyboardLayoutMap`): it is where content owns the answer, it is
+# the one site every `chrome`-on-Windows `getLayoutMap()` reaches, and content/browser may include
+# `components/ungoogled/ungoogled_switches.h` -- `ui/` may not, which is why the equivalent edit in
+# `dom_keyboard_layout_map_win.cc` was rejected rather than routed around with a literal.
+#
+# Gated on the persona: the rewrite runs only when `--fingerprint=<seed>` is present AND `--lang`
+# carries a language the table knows (`en`, `zh`, `de`, `fr`, `ru`). No seed means no claim, and
+# the host map is the truth; a claimed language with no table falls through rather than guessing,
+# because a wrong map is a stronger tell than a stale one.
+#
+# The application substitutes **values only**. Which physical keys a machine reports (this host's
+# 102nd key, measured as `IntlBackslash: "\\"`) is hardware, not locale, so the key *set* stays
+# the host's and the persona neither inserts a key its machine lacks nor deletes one it has --
+# the same one-identity split as everything else in this stage: values follow the claim, hardware
+# follows the host. Control keys (Shift, Enter, the arrows) are identical across these layouts and
+# stay host too. On the committed persona case -- an en-US claim on this US host -- the map is
+# therefore leaf-identical, which is the honest reading: the claim already agreed with the host.
+# The movement a German claim buys is measured in 6.22.
+#
+# Assertion 2 holds by construction: the map is answered once per call from one browser-process
+# map, so the main frame, a cross-site iframe and a Worker read the same value.
+
+
+--- a/content/browser/renderer_host/render_widget_host_view_aura.cc
++++ b/content/browser/renderer_host/render_widget_host_view_aura.cc
+@@ -30,6 +30,7 @@
+ #include "components/input/cursor_manager.h"
+ #include "components/input/events_helper.h"
+ #include "components/input/render_widget_host_input_event_router.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/features.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+@@ -1515,12 +1516,185 @@
+   return event_handler_->IsKeyboardLocked();
+ }
+ 
++// Veil 971: unshifted writing-system keys for the layouts a persona can claim through its locale
++// (`--lang`, which is also what `972`'s generic families and `968`'s default voice follow -- one
++// locale, one set of OS-configured answers). Key names are the DOM code strings
++// `KeyboardLayoutMap` reports. Each table is the layout's own unshifted mapping -- the values
++// Windows produces for its "US", "German", "French" and "Russian" layouts, the same question
++// `dom_keyboard_layout_map_win.cc` asks `ToUnicodeEx` -- and the application below substitutes
++// these values into the host's map, which leaves the *key set* (a hardware fact: which physical
++// keys exist) and the control keys (Shift, Enter, the arrows: identical across these layouts) as
++// the host answered them. `en` and `zh` share the US table because a zh-* locale's IME sits on
++// US-QWERTY hardware, and the remaining Latin locales answer from it too; that simplification is
++// recorded here rather than modelled as separate layouts this tree cannot verify. Non-Latin
++// letters are written as their UTF-8 byte escapes so the file stays ASCII.
++struct VeilLayoutEntry {
++  const char* code;
++  const char* key;
++};
++
++struct VeilKeyboardLayout {
++  const char* language;
++  base::span<const VeilLayoutEntry> entries;
++};
++
++constexpr VeilLayoutEntry kVeilLayoutUS[] = {
++    {"Backquote", "`"},   {"Digit1", "1"},     {"Digit2", "2"},
++    {"Digit3", "3"},      {"Digit4", "4"},     {"Digit5", "5"},
++    {"Digit6", "6"},      {"Digit7", "7"},     {"Digit8", "8"},
++    {"Digit9", "9"},      {"Digit0", "0"},     {"Minus", "-"},
++    {"Equal", "="},       {"KeyQ", "q"},
++    {"KeyW", "w"},        {"KeyE", "e"},       {"KeyR", "r"},
++    {"KeyT", "t"},        {"KeyY", "y"},       {"KeyU", "u"},
++    {"KeyI", "i"},        {"KeyO", "o"},       {"KeyP", "p"},
++    {"BracketLeft", "["}, {"BracketRight", "]"}, {"Backslash", "\\"},
++    {"KeyA", "a"},        {"KeyS", "s"},       {"KeyD", "d"},
++    {"KeyF", "f"},        {"KeyG", "g"},       {"KeyH", "h"},
++    {"KeyJ", "j"},        {"KeyK", "k"},       {"KeyL", "l"},
++    {"Semicolon", ";"},   {"Quote", "'"},
++    {"KeyZ", "z"},        {"KeyX", "x"},       {"KeyC", "c"},
++    {"KeyV", "v"},        {"KeyB", "b"},       {"KeyN", "n"},
++    {"KeyM", "m"},        {"Comma", ","},      {"Period", "."},
++    {"Slash", "/"},
++};
++
++constexpr VeilLayoutEntry kVeilLayoutDE[] = {
++    {"Backquote", "^"},   {"Digit1", "1"},     {"Digit2", "2"},
++    {"Digit3", "3"},      {"Digit4", "4"},     {"Digit5", "5"},
++    {"Digit6", "6"},      {"Digit7", "7"},     {"Digit8", "8"},
++    {"Digit9", "9"},      {"Digit0", "0"},     {"Minus", "\xC3\x9F"},  // ß
++    {"Equal", "\xC2\xB4"},  // ´
++    {"KeyQ", "q"},       {"KeyW", "w"},
++    {"KeyE", "e"},        {"KeyR", "r"},       {"KeyT", "t"},
++    {"KeyY", "z"},        {"KeyU", "u"},       {"KeyI", "i"},
++    {"KeyO", "o"},        {"KeyP", "p"},       {"BracketLeft", "\xC3\xBC"},  // ü
++    {"BracketRight", "+"}, {"Backslash", "#"}, {"KeyA", "a"},
++    {"KeyS", "s"},        {"KeyD", "d"},       {"KeyF", "f"},
++    {"KeyG", "g"},        {"KeyH", "h"},       {"KeyJ", "j"},
++    {"KeyK", "k"},        {"KeyL", "l"},       {"Semicolon", "\xC3\xB6"},  // ö
++    {"Quote", "\xC3\xA4"},  // ä
++    {"IntlBackslash", "<"}, {"KeyZ", "y"},     {"KeyX", "x"},
++    {"KeyC", "c"},        {"KeyV", "v"},       {"KeyB", "b"},
++    {"KeyN", "n"},        {"KeyM", "m"},       {"Comma", ","},
++    {"Period", "."},      {"Slash", "-"},
++};
++
++constexpr VeilLayoutEntry kVeilLayoutFR[] = {
++    {"Backquote", "\xC2\xB2"},  // ²
++    {"Digit1", "&"},      {"Digit2", "\xC3\xA9"},  // é
++    {"Digit3", "\""},     {"Digit4", "'"},     {"Digit5", "("},
++    {"Digit6", "-"},      {"Digit7", "\xC3\xA8"},  // è
++    {"Digit8", "_"},      {"Digit9", "\xC3\xA7"},  // ç
++    {"Digit0", "\xC3\xA0"},  // à
++    {"Minus", ")"},       {"Equal", "="},
++    {"KeyQ", "a"},        {"KeyW", "z"},       {"KeyE", "e"},
++    {"KeyR", "r"},        {"KeyT", "t"},       {"KeyY", "y"},
++    {"KeyU", "u"},        {"KeyI", "i"},       {"KeyO", "o"},
++    {"KeyP", "p"},        {"BracketLeft", "^"}, {"BracketRight", "$"},
++    {"Backslash", "*"},   {"KeyA", "q"},       {"KeyS", "s"},
++    {"KeyD", "d"},        {"KeyF", "f"},       {"KeyG", "g"},
++    {"KeyH", "h"},        {"KeyJ", "j"},       {"KeyK", "k"},
++    {"KeyL", "l"},        {"Semicolon", "m"},  {"Quote", "\xC3\xB9"},  // ù
++    {"IntlBackslash", "<"}, {"KeyZ", "w"},     {"KeyX", "x"},
++    {"KeyC", "c"},        {"KeyV", "v"},       {"KeyB", "b"},
++    {"KeyN", "n"},        {"KeyM", ","},       {"Comma", ";"},
++    {"Period", ":"},      {"Slash", "!"},
++};
++
++constexpr VeilLayoutEntry kVeilLayoutRU[] = {
++    {"Backquote", "\xD1\x91"},  // ё
++    {"Digit1", "1"},      {"Digit2", "2"},     {"Digit3", "3"},
++    {"Digit4", "4"},      {"Digit5", "5"},     {"Digit6", "6"},
++    {"Digit7", "7"},      {"Digit8", "8"},     {"Digit9", "9"},
++    {"Digit0", "0"},      {"Minus", "-"},      {"Equal", "="},
++    {"KeyQ", "\xD0\xB9"},  // й
++    {"KeyW", "\xD1\x86"},  // ц
++    {"KeyE", "\xD1\x83"},  // у
++    {"KeyR", "\xD0\xBA"},  // к
++    {"KeyT", "\xD0\xB5"},  // е
++    {"KeyY", "\xD0\xBD"},  // н
++    {"KeyU", "\xD0\xB3"},  // г
++    {"KeyI", "\xD1\x88"},  // ш
++    {"KeyO", "\xD1\x89"},  // щ
++    {"KeyP", "\xD0\xB7"},  // з
++    {"BracketLeft", "\xD1\x85"},  // х
++    {"BracketRight", "\xD1\x8A"},  // ъ
++    {"Backslash", "\\"},  {"KeyA", "\xD1\x84"},  // ф
++    {"KeyS", "\xD1\x8B"},  // ы
++    {"KeyD", "\xD0\xB2"},  // в
++    {"KeyF", "\xD0\xB0"},  // а
++    {"KeyG", "\xD0\xBF"},  // п
++    {"KeyH", "\xD1\x80"},  // р
++    {"KeyJ", "\xD0\xBE"},  // о
++    {"KeyK", "\xD0\xBB"},  // л
++    {"KeyL", "\xD0\xB4"},  // д
++    {"Semicolon", "\xD0\xB6"},  // ж
++    {"Quote", "\xD1\x8D"},  // э
++    {"KeyZ", "\xD1\x8F"},  // я
++    {"KeyX", "\xD1\x87"},  // ч
++    {"KeyC", "\xD1\x81"},  // с
++    {"KeyV", "\xD0\xBC"},  // м
++    {"KeyB", "\xD0\xB8"},  // и
++    {"KeyN", "\xD1\x82"},  // т
++    {"KeyM", "\xD1\x8C"},  // ь
++    {"Comma", "\xD0\xB1"},  // б
++    {"Period", "\xD1\x8E"},  // ю
++    {"Slash", "/"},
++};
++
++constexpr VeilKeyboardLayout kVeilKeyboardLayouts[] = {
++    {"en", kVeilLayoutUS},
++    {"zh", kVeilLayoutUS},
++    {"de", kVeilLayoutDE},
++    {"fr", kVeilLayoutFR},
++    {"ru", kVeilLayoutRU},
++};
++
++const VeilKeyboardLayout* VeilKeyboardLayoutForLanguage(
++    const std::string& language) {
++  for (const VeilKeyboardLayout& layout : kVeilKeyboardLayouts) {
++    if (language == layout.language) {
++      return &layout;
++    }
++  }
++  return nullptr;
++}
++
+ base::flat_map<std::string, std::string>
+ RenderWidgetHostViewAura::GetKeyboardLayoutMap() {
+   aura::WindowTreeHost* host = window_->GetHost();
+-  if (host)
+-    return host->GetKeyboardLayoutMap();
+-  return {};
++  base::flat_map<std::string, std::string> dom_map =
++      host ? host->GetKeyboardLayoutMap() : base::flat_map<std::string, std::string>();
++
++  // Veil 971: the layout map is the host's otherwise -- every persona reports the physical
++  // keyboard this machine happens to have, which is how a macOS persona on this build host
++  // reported 48 keys of US-QWERTY (T22, Veil/docs/MIGRATION-UNGOOGLED.md 6.22). When a persona is
++  // presented and its locale claims a layout this table knows, the writing-system keys are
++  // answered from the claimed layout's own map instead. Controls (Shift, Enter, the arrows) are
++  // identical across these layouts and are left as the host answered them; a locale with no table
++  // leaves the host map untouched, because a wrong map is a stronger tell than a stale one.
++  // clearcote's `150` pins one US-QWERTY map for every claim; following the locale is Veil's.
++  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++  if (!command_line || !command_line->HasSwitch(switches::kFingerprint) ||
++      !command_line->HasSwitch(switches::kLang)) {
++    return dom_map;
++  }
++  const std::string lang =
++      base::ToLowerASCII(command_line->GetSwitchValueASCII(switches::kLang));
++  const std::string language = lang.substr(0, lang.find('-'));
++  const VeilKeyboardLayout* layout = VeilKeyboardLayoutForLanguage(language);
++  if (!layout) {
++    return dom_map;
++  }
++  for (const VeilLayoutEntry& entry : layout->entries) {
++    // Substitute only: the *values* follow the claimed layout, while the *key set* stays the
++    // host's hardware -- which keys exist (the 102nd key, JIS ro) is what the machine physically
++    // has, and a persona claiming fewer keys than its own hardware reports is a second tell the
++    // value table must not buy. Codes the host map does not carry are skipped, so this can
++    // neither insert a key the machine lacks nor widen the map.
++    dom_map[entry.code] = entry.key;
++  }
++  return dom_map;
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////

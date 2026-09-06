@@ -1,0 +1,147 @@
+# Origin:  clearcotelabs/clearcote-browser -- the fabrication shape, not the code.
+# Source:  patches/180-geolocation.patch
+# Commit:  clearcote-browser-main tarball, audited 2026-08-24 (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: re-authored. What transferred from `180` is the *shape* -- answer `QueryNextPosition()`
+#          with a fabricated `Geoposition` built from a "--fingerprint-location=lat,lng" read,
+#          `accuracy = 100`, Chromium's own no-sensor sentinels for altitude/heading/speed, and a
+#          task-runner-posted `PositionChanged()`. What does not:
+#          `180` re-parses the switch on every request, and its version answers before the
+#          permission machinery has had its say; the parse here is once per process, and the
+#          fabricated answer is delivered only from `QueryNextPosition()`, which the permission
+#          flow reaches only after `OnGeolocationPermissionStatusUpdated` reports GRANTED -- a
+#          denial goes to `HandlePermissionError()` and never here -- so a persona cannot make a
+#          page that was never granted read coordinates (measured,
+#          Veil/docs/MIGRATION-UNGOOGLED.md 6.22).
+#
+#          `is_precise` is left at its mojom default and `altitude` is the `kBadAltitude` sentinel
+#          rather than 0 -- `CreateGeoposition()` maps anything <= -10000 m to `nullopt`, which is
+#          what a desktop without a barometer reports.
+#
+# Veil-authored `9NN` numbering: `970` has no `070` to correct; `950`-`999` are Veil-authored with
+# no counterpart.
+#
+# ---------------------------------------------------------------------------------------------
+#
+# The last of `000`'s four declared-but-unread switches.
+#
+# `000` has declared `--fingerprint-location` and propagated it to every renderer since it was
+# ported, and no patch in the set read it -- the mirror image of the Stage 1 lie, living in the
+# tree rather than on Veil's command line. T22 reads it, and Veil's `to_engine_args` gains the
+# arm in the same task, in the order 6.9 fixed: the patch lands, the read is measured, *then* the
+# switch leaves NOT_IN_TIER_ONE (Veil/docs/STAGE-6-FULL-COVERAGE.md 1).
+#
+# Why a switch at all, when the persona already carries a seed: the coordinates are the one surface
+# the user has to be able to point at. Veil is offline and holds no geo-IP table, so the engine
+# cannot derive a plausible position from the proxy exit the way T19's `--webrtc-ip` does for the
+# srflx candidate; a seed-derived coordinate would put the persona in a field or an ocean beside a
+# timezone it cannot agree with. The value is therefore declared, and `veil_core::validate` owns
+# the proxy-exit <-> timezone <-> coordinate agreement (6.22) -- the engine cannot check it, so the
+# configuration layer must. The switch is deliberately not consulted with `--disable-spoofing`:
+# it is not a spoof of a host surface -- the host has no coordinates to restore -- and the opt-out
+# is deleting the value from the profile.
+#
+# Nothing moves without the switch: with no `--fingerprint-location` the fabricated position is
+# `nullopt` and `QueryNextPosition()` is byte-for-byte the stock call.
+
+--- a/third_party/blink/renderer/core/geolocation/geolocation.cc
++++ b/third_party/blink/renderer/core/geolocation/geolocation.cc
+@@ -32,6 +32,10 @@
+ 
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
++#include "base/command_line.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
+ #include "services/device/public/mojom/geoposition.mojom-blink.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+@@ -40,6 +44,7 @@
+ #include "third_party/blink/renderer/core/frame/deprecation/deprecation.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
++#include "components/ungoogled/ungoogled_switches.h"
+ #include "third_party/blink/renderer/core/frame/performance_monitor.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/geolocation/geo_notifier_blink.h"
+@@ -64,6 +69,56 @@
+     "Geolocation access has been blocked because of a permissions policy "
+     "applied to the current document. See https://crbug.com/414348233 for more "
+     "details.";
++
++// Veil 970: the persona's declared position, parsed once per renderer process.
++// `--fingerprint-location=lat,lng` is what `000` has declared since the port and what nothing
++// read until this patch; see the patch header. `nullptr` is "no claim" -- the switch is absent,
++// malformed, or outside WGS84 -- and every caller treats it as "answer from the real device
++// service", i.e. stock. `base::NoDestructor` keeps the parse off the exit-time-destructor list.
++const device::mojom::blink::Geoposition* VeilPersonaPosition() {
++  static const base::NoDestructor<std::optional<device::mojom::blink::Geoposition>>
++      position([] {
++        const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++        if (!command_line->HasSwitch(switches::kFingerprintLocation)) {
++          return std::optional<device::mojom::blink::Geoposition>();
++        }
++        const std::string value =
++            command_line->GetSwitchValueASCII(switches::kFingerprintLocation);
++        const size_t comma = value.find(',');
++        if (comma == std::string::npos) {
++          return std::optional<device::mojom::blink::Geoposition>();
++        }
++        double latitude = 0.;
++        double longitude = 0.;
++        if (!base::StringToDouble(value.substr(0, comma), &latitude) ||
++            !base::StringToDouble(value.substr(comma + 1), &longitude)) {
++          return std::optional<device::mojom::blink::Geoposition>();
++        }
++        // WGS84 bounds, the same test `ValidateGeoposition()` applies to a real answer -- a
++        // declaration outside them would produce a position no receiver accepts.
++        if (latitude < -90. || latitude > 90. || longitude < -180. || longitude > 180.) {
++          return std::optional<device::mojom::blink::Geoposition>();
++        }
++        device::mojom::blink::Geoposition fabricated;
++        fabricated.latitude = latitude;
++        fabricated.longitude = longitude;
++        // A hundred metres is a coarse urban fix: precise enough to read as a real network
++        // location, coarse enough that no page can steer a map pin onto a specific building the
++        // declaration cannot name.
++        fabricated.accuracy = 100.;
++        // The kBadAltitude family are Chromium's own "no sensor" sentinels; `CreateGeoposition()`
++        // turns each into `nullopt`, which is what a desktop without the hardware reports.
++        fabricated.altitude = device::mojom::blink::kBadAltitude;
++        fabricated.altitude_accuracy = device::mojom::blink::kBadAccuracy;
++        fabricated.heading = device::mojom::blink::kBadHeading;
++        fabricated.speed = device::mojom::blink::kBadSpeed;
++        // The mojom comment on `timestamp`: "taken from the host computer's system clock (i.e.
++        // from Time::Now(), not the source device's clock)" -- so Now() *is* the stock provenance.
++        fabricated.timestamp = base::Time::Now();
++        return std::optional<device::mojom::blink::Geoposition>(std::move(fabricated));
++      }());
++  return *position ? &**position : nullptr;
++}
+ 
+ Geoposition* CreateGeoposition(
+     const device::mojom::blink::Geoposition& position) {
+@@ -615,6 +670,22 @@
+ }
+ 
+ void Geolocation::QueryNextPosition() {
++  // Veil 970: with a declared position, answer from the declaration instead of waiting on the
++  // device service. The permission flow is untouched -- this method is reached only after
++  // `OnGeolocationPermissionStatusUpdated` reported GRANTED (a denial goes to
++  // `HandlePermissionError()` and never here), so the fabricated position is delivered on exactly
++  // the paths a real one would be. One answer per request, as the real service gives; a
++  // `watchPosition` re-enters through `UpdateGeolocationState()` and receives the same coordinates
++  // with a fresh timestamp, which is what a stationary device produces.
++  if (const auto* persona = VeilPersonaPosition()) {
++    last_position_ = CreateGeoposition(*persona);
++    GetExecutionContext()
++        ->GetTaskRunner(TaskType::kMiscPlatformAPI)
++        ->PostTask(
++            FROM_HERE,
++            blink::BindOnce(&Geolocation::PositionChanged, WrapPersistent(this)));
++    return;
++  }
+   geolocation_->QueryNextPosition(
+       blink::BindOnce(&Geolocation::OnPositionUpdated, WrapPersistent(this)));
+ }

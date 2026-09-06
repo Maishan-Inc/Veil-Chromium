@@ -48,3 +48,6 @@ veil/961-touch-and-pointer-persona.patch
 veil/905-device-memory-switch.patch
 veil/983-webrtc-ip-proxy-exit.patch
 veil/984-webrtc-mdns-hostnames.patch
+veil/970-geolocation-persona.patch
+veil/971-keyboard-layout-persona.patch
+veil/966-farble-per-origin.patch
