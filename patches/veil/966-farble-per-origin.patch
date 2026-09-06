@@ -1,0 +1,730 @@
+# Origin:  clearcotelabs/clearcote-browser -- the seed engine, ported; the wiring, Veil's.
+# Source:  patches/001-farble-seed-core.patch (the seed arithmetic), with 060/070 as the
+#          demonstration of how its seeds re-point the noise surfaces.
+# Commit:  clearcote-browser-main tarball, audited 2026-08-24 (Veil/docs/MIGRATION-UNGOOGLED.md 6.5)
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: the mixing function is 001's, verbatim in its arithmetic (domain hash -> biased high
+#          word, hashed low word, global seed folded into the top bits); the hash of the domain
+#          via base::PersistentHash and the decimal-ASCII rendering for the std::hash<string>
+#          per-pixel keys are 001's too. What is deliberately not taken:
+#          - the PersonaProfile struct (6.9: one identity, one source, and the source is the one
+#            the UI can name) -- the seed reads --fingerprint= alone, like every other surface in
+#            this set;
+#          - the --disable-fingerprint-noise switch -- Veil's opt-out vocabulary is
+#            --disable-spoofing, checked by each surface's own gate exactly as before 966;
+#          - 001's registrable-domain helper read the domain inside components/ungoogled from a
+#            GURL the caller had to build; Veil's takes the host string, because every call site
+#            here holds a SecurityOrigin and net's GetDomainAndRegistry has a host overload.
+#
+# Veil-authored `9NN` numbering: `966` has no `066` to correct; `950`-`999` are Veil-authored with
+# no counterpart. The patches it re-points are `012`/`013`/`015`+`915`/`016`/`950` -- this patch
+# follows them in the series and never edits them in place.
+#
+# ---------------------------------------------------------------------------------------------
+#
+# What per-origin deterministic farbling buys, and what it costs.
+#
+# Before 966, every noise surface in this set derives its values from `--fingerprint=<seed>`
+# alone: the same profile renders the same canvas bytes on every site it visits, and those bytes
+# are one constant a fingerprinter can correlate across sites. After it, the seed is mixed with
+# the page's registrable domain (eTLD+1), so the SAME profile yields DIFFERENT canvas, WebGL
+# readPixels, measureText and offline-audio values on different sites -- the cross-site
+# correlation link is broken -- while each site sees values that are bit-identical across
+# restarts, because the derivation is pure hash arithmetic over (seed, domain). That is Brave's
+# farbling model, and it is the change that makes canvas noise survive a tracker embedded in two
+# of the user's sites.
+#
+# Scope, and the rule that governs it: the farbling seed replaces ONLY the noise derivation's
+# input. Every gate (fingerprint present; the surface's --disable-spoofing key absent) stays
+# exactly where it was, and the seed joins the value the caller already had: each site computes
+# `SeedString(DomainForHost(origin->Host()))` from the execution context it already holds --
+# the 2D context, the WebGL context, the canvas element, the blob creator's context, the video
+# element, the AX object, the audits agent and the offline audio destination. Surfaces that are
+# NOT per-origin on purpose: the identity surfaces (UA, fonts, GPU names -- a machine is one
+# machine wherever it stands), the display block, the speech catalogue, baseLatency and 984's
+# mDNS hostnames -- 966 re-points the five noise patches only, per T20's scope.
+#
+# The opt-out story is unchanged and is the reason `--disable-spoofing` did not need a new key:
+# opting canvas out still removes the canvas surfaces and WebGL readPixels, audio still removes
+# the render noise -- and with no seed present, GlobalSeed() returns 0 and every gate is closed
+# exactly as before. A seedless profile farbles nothing because nothing is perturbed at all.
+#
+# Assertion 2 (cross-realm equality) is re-scoped in the same commit as this patch, per 6.13's
+# precedent for assertion-affecting changes: main frame and Worker share the fixture's origin, so
+# every noise leaf still agrees between them -- but the cross-site iframe is a second origin by
+# design, and under a seed its noise leaves now MUST differ from the main frame's. That
+# difference is the feature working; the harness (`tools/detection-baseline/lib/assertions.mjs`)
+# scores it as a farbling check instead of a divergence. The committed `default` case has no
+# seed, so nothing is perturbed and all three realms remain identical there.
+#
+# Measured on the local build (6.23): persona case -- main and Worker identical, iframe differs
+# in every farbled leaf; seed 8 -- every farbled leaf differs from seed 424242's; the unseeded
+# `default` case byte-identical to the pre-966 engine.
+
+--- a/components/ungoogled/BUILD.gn
++++ b/components/ungoogled/BUILD.gn
+@@ -7,6 +7,7 @@
+     "audio_persona.h",
+     "device_memory_persona.h",
+     "display_persona.h",
++    "farble_seed.h",
+     "fingerprint_data.h",
+     "font_persona.h",
+     "input_persona.h",
+@@ -25,5 +26,6 @@
+   deps = [
+     "//base",
+     "//base/version_info:generate_version_info",
++    "//net",
+   ]
+ }
+--- /dev/null
++++ b/components/ungoogled/farble_seed.h
+@@ -0,0 +1,80 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// 966 -- the per-origin farbling seed.
++//
++// Ported from clearcotelabs/clearcote-browser's 001-farble-seed-core.patch (BSD-3-Clause, see
++// CREDITS.md): one global seed from --fingerprint=<seed>, mixed with the page's registrable
++// domain (eTLD+1), produces a 64-bit seed that is stable per (profile, origin) across restarts
++// and distinct across origins. The mixing function below is 001's, verbatim in its arithmetic;
++// what is deliberately NOT taken is 001's PersonaProfile struct (6.9: one identity, one source,
++// and the source is the one the UI can name) and its --disable-fingerprint-noise switch (Veil's
++// opt-out vocabulary is --disable-spoofing, checked by each surface's own gate as before).
++//
++// The domain is the eTLD+1 via net's registry-controlled-domain list -- the same list
++// SameDomainOrHost uses for first-party detection in this tree (local_dom_window.cc). Hosts with
++// no registry entry (IP literals, localhost, file://) hash under the host itself, so the
++// harness's 127.0.0.1 / localhost pair -- two sites to Chromium -- yields two distinct seeds.
++
++#ifndef COMPONENTS_UNGOOGLED_FARBLE_SEED_H_
++#define COMPONENTS_UNGOOGLED_FARBLE_SEED_H_
++
++#include <cstdint>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/hash/hash.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/ungoogled_switches.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++
++namespace ungoogled {
++namespace farble {
++
++inline uint32_t GlobalSeed() {
++  const base::CommandLine* cmd = base::CommandLine::ForCurrentProcess();
++  if (!cmd->HasSwitch(switches::kFingerprint)) {
++    return 0u;
++  }
++  const std::string raw = cmd->GetSwitchValueASCII(switches::kFingerprint);
++  uint64_t parsed = 0;
++  if (base::StringToUint64(raw, &parsed)) {
++    return static_cast<uint32_t>(parsed);
++  }
++  return base::PersistentHash(raw);
++}
++
++// 001's mixing: domain hash -> high word (biased by the global seed), hashed low word, and the
++// global seed folded into the top bits. Same (seed, domain) pair -> same 64 bits in every
++// process and every run; distinct domains decorrelate.
++inline uint64_t Seed64(std::string_view registrable_domain) {
++  const uint32_t global_seed = GlobalSeed();
++  const uint32_t dhash = base::PersistentHash(registrable_domain);
++  const uint32_t high = dhash + global_seed - 1u;
++  const uint32_t low = base::PersistentHash(base::byte_span_from_ref(high));
++  return (static_cast<uint64_t>(high) << 32) ^ static_cast<uint64_t>(low) ^
++         (static_cast<uint64_t>(global_seed) << 16);
++}
++
++// Decimal-ASCII rendering, for the std::hash<std::string> per-pixel/per-frame keys the noise
++// sites already build.
++inline std::string SeedString(std::string_view registrable_domain) {
++  return base::NumberToString(Seed64(registrable_domain));
++}
++
++// eTLD+1 for a host, or the host itself when the registry list answers nothing. An empty host
++// (an opaque origin) hashes to a stable fallback, which is what 001 specifies.
++inline std::string DomainForHost(std::string_view host) {
++  const std::string domain =
++      net::registry_controlled_domains::GetDomainAndRegistry(
++          host, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  return domain.empty() ? std::string(host) : domain;
++}
++
++}  // namespace farble
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_FARBLE_SEED_H_
+--- a/third_party/blink/renderer/platform/graphics/static_bitmap_image.h
++++ b/third_party/blink/renderer/platform/graphics/static_bitmap_image.h
+@@ -38,7 +38,12 @@
+ 
+   StaticBitmapImage(ImageOrientation orientation) : orientation_(orientation) {}
+ 
+-  static void ShuffleSubchannelColorData(const void *addr, const SkImageInfo& info, int srcX, int srcY);
++  static void ShuffleSubchannelColorData(
++      const void* addr,
++      const SkImageInfo& info,
++      int srcX,
++      int srcY,
++      const std::string& farble_seed);
+ 
+   bool IsStaticBitmapImage() const override { return true; }
+ 
+--- a/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
++++ b/third_party/blink/renderer/platform/graphics/static_bitmap_image.cc
+@@ -128,7 +128,12 @@
+ 
+ #define writable_addr(T, p, stride, x, y) (T*)((const char *)p + y * stride + x * sizeof(T))
+ 
+-void StaticBitmapImage::ShuffleSubchannelColorData(const void *addr, const SkImageInfo& info, int srcX, int srcY) {
++void StaticBitmapImage::ShuffleSubchannelColorData(
++    const void* addr,
++    const SkImageInfo& info,
++    int srcX,
++    int srcY,
++    const std::string& farble_seed) {
+   auto w = info.width() - srcX, h = info.height() - srcY;
+ 
+   // skip tiny images; info.width()/height() can also be 0
+@@ -136,13 +141,10 @@
+     return;
+   }
+ 
+-  std::string seed_str = "0";
+-  const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+-  if (command_line->HasSwitch(switches::kFingerprint) &&
+-      (!command_line->HasSwitch(switches::kDisableSpoofing) ||
+-       command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
+-      seed_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
+-  }
++  // 966: the seed is per-origin (eTLD+1 of the surface's document) and is computed by the
++  // caller, which owns the execution context. The gate (fingerprint present, canvas not opted
++  // out) also stays at the callers -- every one of them already had it before this patch.
++  std::string seed_str = farble_seed;
+ 
+   auto colorType = info.colorType();
+   auto fRowBytes = info.minRowBytes(); // stride
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -28,6 +28,8 @@
+ #include "cc/paint/paint_flags.h"
+ #include "cc/paint/paint_image.h"
+ #include "cc/paint/record_paint_canvas.h"
++#include "components/ungoogled/farble_seed.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+ #include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
+@@ -521,7 +523,15 @@
+     if (read_pixels_successful && command_line->HasSwitch(switches::kFingerprint) &&
+         (!command_line->HasSwitch(switches::kDisableSpoofing) ||
+          command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
+-      StaticBitmapImage::ShuffleSubchannelColorData(image_data_pixmap.addr(), image_data_pixmap.info(), sx, sy);
++      const auto* veil_origin =
++          GetTopExecutionContext()
++              ? GetTopExecutionContext()->GetSecurityOrigin()
++              : nullptr;
++      const std::string veil_farble_seed = ungoogled::farble::SeedString(
++          ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                       : std::string()));
++      StaticBitmapImage::ShuffleSubchannelColorData(
++          image_data_pixmap.addr(), image_data_pixmap.info(), sx, sy, veil_farble_seed);
+     }
+   }
+ 
+@@ -1170,7 +1180,13 @@
+   if (command_line->HasSwitch(switches::kFingerprint) &&
+       (!command_line->HasSwitch(switches::kDisableSpoofing) ||
+        command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
+-    std::string seed_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
++    // 966: the measureText noise is per-origin like every other canvas surface.
++    const auto* veil_origin =
++        GetTopExecutionContext() ? GetTopExecutionContext()->GetSecurityOrigin()
++                                 : nullptr;
++    std::string seed_str = ungoogled::farble::SeedString(
++        ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                     : std::string()));
+     std::string combined_rects_x = seed_str + "clientrects_noise_x";
+     uint32_t hash_val_x = std::hash<std::string>{}(combined_rects_x);
+      // 映射到[-0.5, 0.5]范围
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -48,8 +48,11 @@
+ 
+  public:
+   static std::unique_ptr<ImageDataBuffer> Create(
+-      scoped_refptr<StaticBitmapImage>);
+-  static std::unique_ptr<ImageDataBuffer> Create(const SkPixmap&);
++      scoped_refptr<StaticBitmapImage>,
++      const std::string& farble_seed = std::string());
++  static std::unique_ptr<ImageDataBuffer> Create(
++      const SkPixmap&,
++      const std::string& farble_seed = std::string());
+ 
+   String ToDataURL(const ImageEncodingMimeType mime_type,
+                    const double& quality) const;
+@@ -60,14 +63,16 @@
+   base::span<const uint8_t> PixelData() const;
+ 
+  private:
+-  ImageDataBuffer(const SkPixmap&);
+-  ImageDataBuffer(scoped_refptr<StaticBitmapImage>);
++  ImageDataBuffer(const SkPixmap&, const std::string& farble_seed);
++  ImageDataBuffer(scoped_refptr<StaticBitmapImage>,
++                  const std::string& farble_seed);
+ 
+   bool IsValid() { return is_valid_; }  // Only used by Create()
+ 
+   sk_sp<SkImage> retained_image_;
+   SkPixmap pixmap_;
+   bool is_valid_ = false;
++  std::string farble_seed_;
+ };
+ 
+ }  // namespace blink
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -47,7 +47,9 @@
+ 
+ namespace blink {
+ 
+-ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
++ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image,
++                                 const std::string& farble_seed)
++    : farble_seed_(farble_seed) {
+   if (!image)
+     return;
+   PaintImage paint_image = image->PaintImageForCurrentFrame();
+@@ -103,24 +105,28 @@
+   is_valid_ = true;
+ }
+ 
+-ImageDataBuffer::ImageDataBuffer(const SkPixmap& pixmap)
++ImageDataBuffer::ImageDataBuffer(const SkPixmap& pixmap,
++                                 const std::string& farble_seed)
+     : pixmap_(pixmap),
++      farble_seed_(farble_seed),
+       is_valid_(pixmap_.addr() &&
+                 !gfx::Size(pixmap.width(), pixmap.height()).IsEmpty()) {}
+ 
+ std::unique_ptr<ImageDataBuffer> ImageDataBuffer::Create(
+-    scoped_refptr<StaticBitmapImage> image) {
++    scoped_refptr<StaticBitmapImage> image,
++    const std::string& farble_seed) {
+   std::unique_ptr<ImageDataBuffer> buffer =
+-      base::WrapUnique(new ImageDataBuffer(image));
++      base::WrapUnique(new ImageDataBuffer(image, farble_seed));
+   if (!buffer->IsValid())
+     return nullptr;
+   return buffer;
+ }
+ 
+ std::unique_ptr<ImageDataBuffer> ImageDataBuffer::Create(
+-    const SkPixmap& pixmap) {
++    const SkPixmap& pixmap,
++    const std::string& farble_seed) {
+   std::unique_ptr<ImageDataBuffer> buffer =
+-      base::WrapUnique(new ImageDataBuffer(pixmap));
++      base::WrapUnique(new ImageDataBuffer(pixmap, farble_seed));
+   if (!buffer->IsValid())
+     return nullptr;
+   return buffer;
+@@ -139,7 +145,8 @@
+       (!command_line->HasSwitch(switches::kDisableSpoofing) ||
+        command_line->GetSwitchValueASCII(switches::kDisableSpoofing).find("canvas") == std::string::npos)) {
+     // shuffle subchannel color data within the pixmap
+-    StaticBitmapImage::ShuffleSubchannelColorData(pixmap_.writable_addr(), pixmap_.info(), 0, 0);
++    StaticBitmapImage::ShuffleSubchannelColorData(
++        pixmap_.writable_addr(), pixmap_.info(), 0, 0, farble_seed_);
+   }
+   return ImageEncoder::Encode(encoded_image, pixmap_, mime_type, quality);
+ }
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -43,6 +43,7 @@
+ #include "base/numerics/safe_conversions.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
++#include "components/ungoogled/farble_seed.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "build/build_config.h"
+ #include "cc/layers/texture_layer.h"
+@@ -1295,6 +1296,15 @@
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
+   if (image_bitmap) {
+ 
++    // 966: the noise seed is per-origin (eTLD+1 of this canvas's document), so
++    // the same profile renders different bytes on different sites while each site is
++    // stable across restarts.
++    const auto* veil_origin =
++        GetExecutionContext() ? GetExecutionContext()->GetSecurityOrigin() : nullptr;
++    const std::string veil_farble_seed = ungoogled::farble::SeedString(
++        ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                     : std::string()));
++
+     // 添加指纹保护：在创建 ImageDataBuffer 之前修改像素数据副本
+     const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+     if (command_line->HasSwitch(switches::kFingerprint) &&
+@@ -1321,7 +1331,7 @@
+ 
+           // 对副本应用指纹保护修改（不影响原始数据）
+           StaticBitmapImage::ShuffleSubchannelColorData(
+-              pixel_buffer.data(), image_info, 0, 0);
++              pixel_buffer.data(), image_info, 0, 0, veil_farble_seed);
+ 
+           // 用修改后的像素数据创建完全新的图像对象
+           sk_sp<SkData> modified_data = SkData::MakeWithCopy(pixel_buffer.data(), buffer_size);
+@@ -1345,7 +1355,7 @@
+     }
+ 
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+-        ImageDataBuffer::Create(image_bitmap);
++        ImageDataBuffer::Create(image_bitmap, veil_farble_seed);
+     if (!data_buffer)
+       return String("data:,");
+ 
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h"
++
++#include "components/ungoogled/farble_seed.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ 
+ #include "base/location.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -272,6 +275,11 @@
+ //  - For the in-thread case (2b), not stored anywhere, because encoding happens
+ //    within this function.
+ void CanvasAsyncBlobCreator::ScheduleAsyncBlobCreation(const double& quality) {
++  // 966: the per-origin noise seed for both encode paths below.
++  const auto* veil_origin = context_ ? context_->GetSecurityOrigin() : nullptr;
++  const std::string veil_farble_seed = ungoogled::farble::SeedString(
++      ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                   : std::string()));
+   if (!static_bitmap_image_loaded_) {
+     context_->GetTaskRunner(TaskType::kCanvasBlobSerialization)
+         ->PostTask(FROM_HERE,
+@@ -301,7 +309,8 @@
+       // we do not need to use background task runner to reduce load on main.
+       // So we just directly encode images on the worker thread.
+       Vector<unsigned char> encoded_image;
+-      if (!EncodeImage(ImageDataBuffer::Create(src_data_), mime_type_, quality,
++      if (!EncodeImage(ImageDataBuffer::Create(src_data_, veil_farble_seed),
++                     mime_type_, quality,
+                        &encoded_image)) {
+         context_->GetTaskRunner(TaskType::kCanvasBlobSerialization)
+             ->PostTask(
+@@ -324,7 +333,7 @@
+           FROM_HERE, CrossThreadBindOnce(
+                          &CanvasAsyncBlobCreator::EncodeImageOnEncoderThread,
+                          MakeCrossThreadHandle(this), parent_frame_task_runner_,
+-                         skia_image_, ImageDataBuffer::Create(src_data_),
++                         skia_image_, ImageDataBuffer::Create(src_data_, veil_farble_seed),
+                          mime_type_, quality));
+     }
+   } else {
+--- a/third_party/blink/renderer/core/html/media/html_video_element.cc
++++ b/third_party/blink/renderer/core/html/media/html_video_element.cc
+@@ -24,6 +24,9 @@
+  */
+ 
+ #include "third_party/blink/renderer/core/html/media/html_video_element.h"
++
++#include "components/ungoogled/farble_seed.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ 
+ #include <memory>
+ 
+@@ -523,7 +526,12 @@
+   if (!image) {
+     return;
+   }
+-  auto data_buffer = ImageDataBuffer::Create(image);
++  const auto* veil_origin =
++      GetExecutionContext() ? GetExecutionContext()->GetSecurityOrigin() : nullptr;
++  const std::string veil_farble_seed = ungoogled::farble::SeedString(
++      ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                   : std::string()));
++  auto data_buffer = ImageDataBuffer::Create(image, veil_farble_seed);
+   if (!data_buffer) {
+     return;
+   }
+--- a/third_party/blink/renderer/modules/accessibility/ax_node_object.cc
++++ b/third_party/blink/renderer/modules/accessibility/ax_node_object.cc
+@@ -27,6 +27,8 @@
+  */
+ 
+ #include "third_party/blink/renderer/modules/accessibility/ax_node_object.h"
++
++#include "components/ungoogled/farble_seed.h"
+ 
+ #include <math.h>
+ 
+@@ -4294,7 +4296,15 @@
+   }
+ 
+   // Encode as a PNG and return as a data url.
+-  std::unique_ptr<ImageDataBuffer> buffer = ImageDataBuffer::Create(pixmap);
++  const auto* veil_origin =
++      GetDocument()->GetExecutionContext()
++          ? GetDocument()->GetExecutionContext()->GetSecurityOrigin()
++          : nullptr;
++  const std::string veil_farble_seed = ungoogled::farble::SeedString(
++      ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                   : std::string()));
++  std::unique_ptr<ImageDataBuffer> buffer =
++      ImageDataBuffer::Create(pixmap, veil_farble_seed);
+ 
+   if (!buffer)
+     return String();
+--- a/third_party/blink/renderer/core/inspector/inspector_audits_agent.cc
++++ b/third_party/blink/renderer/core/inspector/inspector_audits_agent.cc
+@@ -61,8 +61,11 @@
+   if (!image || !image->readPixels(pixmap, 0, 0))
+     return false;
+ 
++  // 966: audits.GetEncodedResponse is a DevTools command, not a page surface -- this free
++  // function holds no ExecutionContext, so it encodes with an empty seed. The empty seed also
++  // means the shuffle inside EncodeImage is inert on a tree where that gate could fire.
+   std::unique_ptr<ImageDataBuffer> image_to_encode =
+-      ImageDataBuffer::Create(pixmap);
++      ImageDataBuffer::Create(pixmap, std::string());
+   if (!image_to_encode)
+     return false;
+ 
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -46,6 +46,8 @@
+ #include "base/trace_event/memory_dump_manager.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
++#include "components/ungoogled/farble_seed.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
+ #include "components/viz/common/resources/shared_image_format_utils.h"
+@@ -5467,7 +5469,14 @@
+       SkImageInfo image_info = SkImageInfo::Make(width, height, color_type, alpha_type);
+ 
+       // 调用指纹保护函数修改已读取的像素数据
+-      StaticBitmapImage::ShuffleSubchannelColorData(data, image_info, 0, 0);
++      const auto* veil_origin =
++          GetExecutionContext() ? GetExecutionContext()->GetSecurityOrigin()
++                               : nullptr;
++      const std::string veil_farble_seed = ungoogled::farble::SeedString(
++          ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                       : std::string()));
++      StaticBitmapImage::ShuffleSubchannelColorData(data, image_info, 0, 0,
++                                                    veil_farble_seed);
+     }
+   }
+ }
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_destination_handler.h"
++
++#include "components/ungoogled/farble_seed.h"
++#include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ 
+ #include <algorithm>
+ 
+@@ -41,7 +44,8 @@
+ // render quantum boundaries nor a suspend/resume, and is identical in every realm and every run.
+ void PerturbRenderedAudio(AudioBus* bus,
+                           size_t first_frame,
+-                          uint32_t frame_count) {
++                          uint32_t frame_count,
++                          const std::string& farble_seed) {
+   const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
+   if (!command_line->HasSwitch(switches::kFingerprint)) {
+     return;
+@@ -51,10 +55,12 @@
+           std::string::npos) {
+     return;
+   }
+-  const std::string seed_str = command_line->GetSwitchValueASCII(switches::kFingerprint);
+-  if (seed_str.empty()) {
+-    return;
+-  }
++  // 966: the seed is per-origin (eTLD+1 of the context that owns this render), passed by the
++  // caller; the gates above are unchanged.
++  if (farble_seed.empty()) {
++    return;
++  }
++  const std::string& seed_str = farble_seed;
+   const uint32_t seed = static_cast<uint32_t>(std::hash<std::string>{}(seed_str + "audio"));
+ 
+   for (unsigned channel_index = 0; channel_index < bus->NumberOfChannels(); ++channel_index) {
+@@ -250,8 +256,15 @@
+     uint32_t frames_available_to_copy = std::min(
+         frames_to_process_, GetDeferredTaskHandler().RenderQuantumFrames());
+ 
++    const auto* veil_origin =
++        Context()->GetExecutionContext()
++            ? Context()->GetExecutionContext()->GetSecurityOrigin()
++            : nullptr;
++    const std::string veil_farble_seed = ungoogled::farble::SeedString(
++        ungoogled::farble::DomainForHost(veil_origin ? veil_origin->Host().Utf8()
++                                                     : std::string()));
+     PerturbRenderedAudio(render_bus_.get(), frames_processed_,
+-                         frames_available_to_copy);
++                         frames_available_to_copy, veil_farble_seed);
+ 
+     for (unsigned channel_index = 0; channel_index < number_of_channels;
+          ++channel_index) {
+--- /dev/null
++++ b/third_party/blink/renderer/platform/image_encoders/image_encoder.cc
+@@ -0,0 +1,140 @@
++// Copyright 2017 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/renderer/platform/image-encoders/image_encoder.h"
++
++#include "base/notreached.h"
++#include "build/build_config.h"
++
++#if BUILDFLAG(IS_WIN)
++#include <basetsd.h>  // Included before jpeglib.h because of INT32 clash
++#endif
++#include <stdio.h>  // Needed by jpeglib.h
++
++#include "jpeglib.h"  // for JPEG_MAX_DIMENSION
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
++#include "third_party/blink/renderer/platform/runtime_enabled_features.h"
++#include "third_party/libwebp/src/src/webp/encode.h"  // for WEBP_MAX_DIMENSION
++
++namespace blink {
++
++bool ImageEncoder::Encode(Vector<unsigned char>* dst,
++                          const SkPixmap& src,
++                          const SkJpegEncoder::Options& options) {
++  VectorWStream dst_stream(dst);
++  return SkJpegEncoder::Encode(&dst_stream, src, options);
++}
++
++bool ImageEncoder::Encode(
++    Vector<unsigned char>* dst,
++    const SkPixmap& src,
++    SkPngRustEncoder::CompressionLevel compression_level) {
++  VectorWStream dst_stream(dst);
++  SkPngRustEncoder::Options options = {.fCompressionLevel = compression_level};
++  return SkPngRustEncoder::Encode(&dst_stream, src, options);
++}
++
++bool ImageEncoder::Encode(Vector<unsigned char>* dst,
++                          const SkPixmap& src,
++                          const SkWebpEncoder::Options& options) {
++  VectorWStream dst_stream(dst);
++  return SkWebpEncoder::Encode(&dst_stream, src, options);
++}
++
++bool ImageEncoder::Encode(Vector<unsigned char>* dst,
++                          const SkPixmap& src,
++                          ImageEncodingMimeType mime_type,
++                          double quality) {
++  if (RuntimeEnabledFeatures::FingerprintingCanvasImageDataNoiseEnabled()) {
++    // shuffle subchannel color data within the pixmap
++    // 966: dormant bromite gate (the RuntimeEnabledFeature is off in this tree); kept compiling
++    // with the new signature and an empty seed -- no origin is reachable at this layer.
++    StaticBitmapImage::ShuffleSubchannelColorData(src.writable_addr(), src.info(), 0, 0, std::string());
++  }
++  switch (mime_type) {
++    case kMimeTypeJpeg: {
++      SkJpegEncoder::Options options;
++      options.fQuality = ComputeJpegQuality(quality);
++      options.fAlphaOption = SkJpegEncoder::AlphaOption::kBlendOnBlack;
++      if (options.fQuality == 100) {
++        options.fDownsample = SkJpegEncoder::Downsample::k444;
++      }
++      return Encode(dst, src, options);
++    }
++    case kMimeTypeWebp: {
++      SkWebpEncoder::Options options = ComputeWebpOptions(quality);
++      return Encode(dst, src, options);
++    }
++    case kMimeTypePng: {
++      return Encode(dst, src, SkPngRustEncoder::CompressionLevel::kLow);
++    }
++  }
++}
++
++std::unique_ptr<ImageEncoder> ImageEncoder::Create(
++    Vector<unsigned char>* dst,
++    const SkPixmap& src,
++    const SkJpegEncoder::Options& options) {
++  std::unique_ptr<ImageEncoder> image_encoder(new ImageEncoder(dst));
++  image_encoder->encoder_ =
++      SkJpegEncoder::Make(&image_encoder->dst_, src, options);
++  if (!image_encoder->encoder_) {
++    return nullptr;
++  }
++
++  return image_encoder;
++}
++
++std::unique_ptr<ImageEncoder> ImageEncoder::Create(
++    Vector<unsigned char>* dst,
++    const SkPixmap& src,
++    SkPngRustEncoder::CompressionLevel compression_level) {
++  std::unique_ptr<ImageEncoder> image_encoder(new ImageEncoder(dst));
++  SkPngRustEncoder::Options options = {.fCompressionLevel = compression_level};
++  image_encoder->encoder_ =
++      SkPngRustEncoder::Make(&image_encoder->dst_, src, options);
++  if (!image_encoder->encoder_) {
++    return nullptr;
++  }
++
++  return image_encoder;
++}
++
++int ImageEncoder::MaxDimension(ImageEncodingMimeType mime_type) {
++  switch (mime_type) {
++    case kMimeTypePng:
++      return 65535;
++    case kMimeTypeJpeg:
++      return JPEG_MAX_DIMENSION;
++    case kMimeTypeWebp:
++      return WEBP_MAX_DIMENSION;
++    default:
++      NOTREACHED();
++  }
++}
++
++int ImageEncoder::ComputeJpegQuality(double quality) {
++  int compression_quality = 92;  // Default value
++  if (0.0f <= quality && quality <= 1.0)
++    compression_quality = static_cast<int>(quality * 100 + 0.5);
++  return compression_quality;
++}
++
++SkWebpEncoder::Options ImageEncoder::ComputeWebpOptions(double quality) {
++  SkWebpEncoder::Options options;
++
++  if (quality == 1.0) {
++    // Choose a lossless encode.  When performing a lossless encode, higher
++    // quality corresponds to slower encoding and smaller output size.
++    options.fCompression = SkWebpEncoder::Compression::kLossless;
++    options.fQuality = 75.0f;
++  } else {
++    options.fQuality = 80.0f;  // Default value
++    if (0.0f <= quality && quality <= 1.0)
++      options.fQuality = quality * 100.0f;
++  }
++
++  return options;
++}
++}  // namespace blink
