@@ -1,1 +1,4 @@
 /build
+
+# Agent workspace data (WorkBuddy): local notes, not part of the repo.
+.workbuddy/
