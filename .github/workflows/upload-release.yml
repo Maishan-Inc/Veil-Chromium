@@ -1,0 +1,146 @@
+# Veil-Chromium — upload-release
+#
+# The upload-only half of the release decision (Veil/docs/ROADMAP.md "Near-term", decided
+# 2026-09-12): no CI can finish a Chromium build (13.3 % in 14.7 h, then stalled —
+# Veil/docs/MIGRATION-UNGOOGLED.md 4.6), so the build runs on the local host and CI's job is
+# to make the *publishing* verifiable rather than to pretend it compiled anything.
+#
+# Division of labour, per release:
+#
+#   1. LOCAL (build host): `python package.py` produces the zip and the installer in
+#      `build/`, then
+#
+#        gh release create <tag> --draft --target <commit> --title "<tag>" --notes-file <file>
+#        gh release upload <tag> build/ungoogled-chromium_<version>_windows_x64.zip \
+#                                      build/ungoogled-chromium_<version>_installer_x64.exe
+#
+#      and the digests the local side measured:
+#
+#        sha256sum build/ungoogled-chromium_*_windows_x64.zip \
+#                  build/ungoogled-chromium_*_installer_x64.exe
+#
+#   2. THIS WORKFLOW (dispatched with the tag and those digests): downloads every asset on
+#      the draft release, hashes it again on the runner, and compares the two. A release is
+#      only ever published (draft -> final, and only when `publish` is checked) when every
+#      digest the build host computed matches what GitHub actually holds. `SHA256SUMS` is
+#      generated from the runner's own measurements — never from the input — and attached to
+#      the release, so a user can verify independently of GitHub (the thing
+#      `checksum_source = "asset_digest"` alone cannot offer). Build provenance is attested
+#      over the exact files the release carries.
+#
+#    `publish-release.yml` (the CI-build path) stays as-is for the day a runner can finish a
+#    Chromium build; until then it cannot fire, because `build-x64` cannot succeed.
+#
+# Inputs
+#   tag       the release tag, e.g. 151.0.7922.137-1.1002
+#   digests   the LOCAL sha256 measurements, one per line or comma-separated,
+#             `<64-hex>:<asset filename>` (no path). Optional but strongly recommended:
+#             without it the job can only publish SHA256SUMS, not verify the upload.
+#   publish   when true and every digest matched, the draft release is published. The
+#             default is false so the first runs are drills.
+
+name: upload-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify and (optionally) publish, e.g. 151.0.7922.137-1.1002"
+        required: true
+        type: string
+      digests:
+        description: "Local sha256 measurements, <hex>:<filename>, newline or comma separated"
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "Publish the release (draft -> final) after every digest matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: upload-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-attest:
+    name: Verify digests, attach SHA256SUMS, attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the draft release and hash its assets
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          release_json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          draft=$(jq -r '.draft' <<<"$release_json")
+          if [ "$draft" != "true" ]; then
+            echo "::error::release ${TAG} is not a draft — refusing to touch it"
+            exit 1
+          fi
+          assets=$(jq -r '.assets[] | select(name | endswith(".zip") or endswith(".exe")) | .name' <<<"$release_json")
+          if [ -z "$assets" ]; then
+            echo "::error::no zip/installer assets on the draft release"
+            exit 1
+          fi
+          : > measured.txt
+          while IFS= read -r asset; do
+            [ -n "$asset" ] || continue
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir dist
+            sha256sum "dist/$asset" | sed 's#  dist/#  #' >> measured.txt
+          done <<<"$assets"
+          echo "-- measured on the runner --"
+          cat measured.txt
+
+      - name: Compare against the build host's digests
+        if: ${{ inputs.digests != '' }}
+        env:
+          DIGESTS: ${{ inputs.digests }}
+        run: |
+          set -euo pipefail
+          # normalise: newline- or comma-separated <hex>:<filename> to `sha256sum` form
+          tr ',\r' '\n\n' <<<"$DIGESTS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | grep -E '^[0-9a-fA-F]{64}:' | awk -F: '{print tolower($1)"  "substr($0, index($0,":")+1)}' \
+            | sort > expected.txt
+          sort measured.txt > measured.sorted.txt
+          if ! diff -u expected.txt measured.sorted.txt; then
+            echo "::error::digest mismatch — the draft release does not hold what the build host measured"
+            exit 1
+          fi
+          echo "all digests match the build host's measurements"
+
+      - name: Attach SHA256SUMS (measured on the runner)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" measured.txt#SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Attest build provenance for the release assets
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.exe
+
+      - name: Publish the draft
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # `gh release edit --draft=false` flips the release live only after every gate above ran
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          echo "release ${TAG} published"
