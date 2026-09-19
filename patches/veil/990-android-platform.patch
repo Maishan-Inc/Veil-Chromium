@@ -1,0 +1,831 @@
+# Origin:  clearcotelabs/clearcote-browser -- the mobile path across 002/010/140/141/150,
+#          ported; the wiring, Veil's. T24-a (Veil/docs/MIGRATION-UNGOOGLED.md 6.24 -> 6.26).
+# Source:  patches/002-persona-profile.patch (the device table, the web-prefs block, the PDF
+#          gate, the media roster), patches/010-user-agent-and-webdriver.patch (the UA/UA-CH
+#          android arms), patches/140-screen.patch + 141-media-queries.patch (the portrait
+#          panel derivation and the Blink pointer/hover getters), patches/150-device-sensors.patch
+#          (battery and netinfo). All BSD-3-Clause; see CREDITS.md.
+# License: BSD-3-Clause (see CREDITS.md), same terms as the code it edits.
+# Changes: what is deliberately NOT taken, per 6.9 (one identity, one source):
+#          - the PersonaProfile struct -- every android branch here reads the seed and the
+#            platform from the command line through components/ungoogled/platform_claim.h,
+#            exactly as 002/006/011/960/961/963/967/968/969/972 do;
+#          - the mutable RNG everywhere -- one device row is picked per seed by a pure hash,
+#            so the browser and every renderer derive the SAME phone with no state to share;
+#          - clearcote's frozen screen values as a second screen source -- the panel still
+#            arrives by --fingerprint-screen-{width,height} / --fingerprint-device-scale-
+#            factor (960's switches), and the launcher derives those from the same device
+#            row the engine reads here (the T24-b coupling, 6.24). The engine never invents
+#            a screen the command line did not declare.
+#
+# What this patch is. T24's android arm: --fingerprint-platform=android becomes a real,
+# self-coherent persona. iOS stays out (6.24: no precedent anywhere, no gate writable).
+# Surface by surface:
+#
+#   UA + UA-CH       " Mobile" product token, unified platform "Linux; Android 10; K",
+#                    navigator.platform "Linux armv81", UA-CH platform "Android" with
+#                    mobile true, empty architecture/bitness (ARM-Android's shape),
+#                    platformVersion and model from the device row
+#   touch + pointer  the device row's touch count through 961's own hook, coarse pointer,
+#                    hover none, touch-event detection ON (a phone has ontouchstart), and
+#                    the mobile-layout web-prefs (viewport meta/style, double-tap zoom)
+#   display          work area = the full panel (Android reports no shell inset); the
+#                    portrait panel itself comes from the launcher through 960's switches
+#   WebGL            the device row's ANGLE-wrapped GLES renderer string and vendor, and a
+#                    GLES 3.2 capability table through 963's resolver, clamped as always
+#   voices           an empty catalogue (a Chrome-on-Android with no bound TTS engine
+#                    reports getVoices() == []) -- never the host's SAPI roster
+#   media devices    a phone roster: mic + the "camera2 N, facing back/front" pair, added
+#                    only for kinds the host lacks (969's additive rule, unchanged)
+#   battery          a phone on battery: discharging, finite discharge estimate, seed-
+#                    derived level -- the debt 6.18 recorded when it measured the desktop
+#                    battery a no-op
+#   netinfo          type wifi, 4g / 10 Mbps / 50 ms -- coherent with the phone claim;
+#                    `type` itself stays unexposed on this desktop binary unless the
+#                    NetInfoDownlinkMax feature is on, exactly as stock gates it
+#   plugins          IsPdfViewerAvailable() false, which empties navigator.plugins,
+#                    navigator.mimeTypes and pdfViewerEnabled in one gate -- the shape
+#                    6.20's plugins-are-the-spec-pdf-set-or-none already scores
+#
+# SERIES POSITION: last. It edits files 002/960/961/963/966/967/968/969/972 own, and per the
+# patches/veil/README rule that is done by a later patch, never in place.
+--- /dev/null
++++ b/components/ungoogled/android_device_data.h
+@@ -0,0 +1,103 @@
++// Copyright (c) 2026 The Veil Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The phone table -- one data header, three rows, no logic beyond the pick.
++//
++// Each row is an ATOMIC, mutually-consistent phone profile: model, Android version,
++// portrait screen + DPR, touch count, GPU IHV + ANGLE-wrapped GLES renderer, cores, RAM and
++// colour gamut are drawn TOGETHER so no surface can contradict another (a Pixel model never
++// pairs with an Adreno string). That atomicity is the whole point of a table: the same row
++// answers UA-CH, WebGL, touch and netinfo, so one seed cannot put a Pixel 7's model beside
++// a Galaxy's GPU.
++//
++// Rows and weights are clearcote's (002), and they are public hardware specifications
++// rather than measurements anyone has to take on faith: Pixel 7 (Tensor G2, Mali-G710,
++// 1080x2400 panel at 2.625x -> 412x915 CSS, 8 cores, 8 GB, Android 14); Galaxy S23
++// (SM-S911B, Snapdragon 8 Gen 2 for Galaxy, Adreno 740, 1080x2340 at 3.0x -> 360x780 CSS,
++// 8 GB, Android 14); Galaxy A54 (SM-A546B, Exynos 1380, Mali-G68 MC4, 1080x2340 at 2.625x
++// -> 412x892 CSS, 8 GB, Android 14). All three are OLED P3 (color-gamut: p3) and
++// five-touch. The screen/DPR pairs are the CSS values Chrome on each device reports; the
++// renderer strings are the ANGLE form WebGL reports on Android ("ANGLE (vendor, renderer,
++// OpenGL ES 3.2)"). Weights 0.50 / 0.30 / 0.20: the flagships the population skews to, with
++// the A54 the mid-tier counterweight.
++//
++// THE PICK IS PURE. `DeviceForSeed` mixes the seed the splitmix64 way clearcote's
++// DerivePersona does, so the browser process and every renderer derive the same row from
++// --fingerprint=<seed> with no shared state -- the same property 011's `fingerprint % count`
++// has, and the reason there is no RNG and no mutable state anywhere in this header.
++//
++// The screen pair in a row is DATA FOR THE LAUNCHER (T24-b derives --window-size and the
++// panel switches from it), not a second screen source in the engine: the engine's display
++// surfaces answer only from 960's switches. This header exists so both sides of that
++// coupling read one table.
++
++#ifndef COMPONENTS_UNGOOGLED_ANDROID_DEVICE_DATA_H_
++#define COMPONENTS_UNGOOGLED_ANDROID_DEVICE_DATA_H_
++
++#include <cstdint>
++
++namespace ungoogled {
++namespace android_device {
++
++struct AndroidDevice {
++  const char* model;             // UA-CH model, e.g. "Pixel 7"
++  const char* platform_version;  // UA-CH platformVersion, e.g. "14.0.0"
++  int screen_w;                  // CSS px, portrait (what screen.width reports)
++  int screen_h;
++  double dpr;                    // devicePixelRatio
++  int max_touch;                 // navigator.maxTouchPoints
++  int hc;                        // hardwareConcurrency
++  int mem_gb;                    // deviceMemory (Chromium reports at most 8)
++  const char* gl_vendor;         // WebGL UNMASKED_VENDOR_WEBGL
++  const char* gl_renderer;       // WebGL UNMASKED_RENDERER_WEBGL (ANGLE-wrapped GLES)
++  int gl_max_texture_size;       // GL_MAX_TEXTURE_SIZE (flagship 16384, mid-tier 8192)
++  const char* color_gamut;       // CSS color-gamut
++};
++
++struct WeightedDevice {
++  AndroidDevice device;
++  int weight;  // out of 100
++};
++
++inline constexpr WeightedDevice kAndroidDevices[] = {
++    {{"Pixel 7", "14.0.0", 412, 915, 2.625, 5, 8, 8, "Google Inc. (ARM)",
++      "ANGLE (ARM, Mali-G710, OpenGL ES 3.2)", 16384, "p3"},
++     50},
++    {{"SM-S911B", "14.0.0", 360, 780, 3.0, 5, 8, 8, "Google Inc. (Qualcomm)",
++      "ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)", 16384, "p3"},
++     30},
++    {{"SM-A546B", "14.0.0", 412, 892, 2.625, 5, 8, 8, "Google Inc. (ARM)",
++      "ANGLE (ARM, Mali-G68 MC4, OpenGL ES 3.2)", 8192, "p3"},
++     20},
++};
++
++inline constexpr int kTotalWeight = 100;
++
++// splitmix64, the same mixing clearcote's DerivePersona uses: weak seeds (1, 2, 3)
++// otherwise land on adjacent picks. Pure -- no RNG object, no state, same answer in every
++// process and across restarts.
++inline uint64_t MixSeed(uint32_t seed) {
++  uint64_t mixed = static_cast<uint64_t>(seed) + 0x9E3779B97F4A7C15ull;
++  mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
++  mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
++  return mixed ^ (mixed >> 31);
++}
++
++// The row this seed presents. Deterministic across processes and restarts.
++inline const AndroidDevice& DeviceForSeed(uint32_t seed) {
++  const uint64_t mixed = MixSeed(seed);
++  int pick = static_cast<int>(mixed % kTotalWeight);
++  for (const WeightedDevice& entry : kAndroidDevices) {
++    pick -= entry.weight;
++    if (pick < 0) {
++      return entry.device;
++    }
++  }
++  return kAndroidDevices[0].device;
++}
++
++}  // namespace android_device
++}  // namespace ungoogled
++
++#endif  // COMPONENTS_UNGOOGLED_ANDROID_DEVICE_DATA_H_
+--- a/components/ungoogled/platform_claim.h
++++ b/components/ungoogled/platform_claim.h
+@@ -99,6 +99,13 @@
+   return SeedPresent() && Claimed() != Host() && !SpoofingDisabled(opt_out_key);
+ }
+ 
++// Veil `990`: the android claim, gated on a seed like every other cross-platform
++// branch. One spelling of the question, because a dozen call sites asking it
++// inline would be a dozen places for the vocabulary to drift.
++inline bool IsAndroidPersona() {
++  return SeedPresent() && Claimed() == "android";
++}
++
+ }  // namespace platform_claim
+ }  // namespace ungoogled
+ 
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -219,6 +219,17 @@
+ std::string GetUserAgentInternal() {
+   std::string product = GetProductAndVersion();
+ 
++  // Veil `990`: the " Mobile" product token a phone's UA carries. Upstream
++  // appends it only under IS_ANDROID behind --use-mobile-user-agent; on this
++  // desktop build the android claim is the only way a phone UA is produced, so
++  // the claim drives the token. Tail: "Chrome/151.0.0.0 Mobile Safari/537.36".
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          switches::kFingerprintPlatform) &&
++      base::ToLowerASCII(base::CommandLine::ForCurrentProcess()
++                             ->GetSwitchValueASCII(
++                                 switches::kFingerprintPlatform)) == "android") {
++    product += " Mobile";
++  }
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(kUseMobileUserAgent)) {
+     product += " Mobile";
+@@ -293,6 +304,10 @@
+     return "X11; ";
+   } else if (platform_value == "macos") {
+     return "Macintosh; ";
++  } else if (platform_value == "android") {
++    // Veil `990`: the Android UA platform prefix. Upstream's own IS_ANDROID
++    // branch below returns the same "Linux; " -- a phone claim keeps it.
++    return "Linux; ";
+   }
+ }
+ #if BUILDFLAG(IS_WIN)
+@@ -325,6 +340,11 @@
+     return "X11; Linux x86_64";
+   } else if (platform_value == "macos") {
+     return "Macintosh; Intel Mac OS X 10_15_7";
++  } else if (platform_value == "android") {
++    // Veil `990`: Chrome's reduced Android platform token, the same constant
++    // upstream's IS_ANDROID branch returns below ("Linux; Android 10; K") -- a
++    // frozen token is what a real phone reports under reduced UA.
++    return "Linux; Android 10; K";
+   }
+ }
+ #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_CHROMEOS)
+--- a/third_party/blink/common/user_agent/user_agent_metadata.cc
++++ b/third_party/blink/common/user_agent/user_agent_metadata.cc
+@@ -11,6 +11,7 @@
+ #include "base/pickle.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "components/ungoogled/android_device_data.h"
+ #include "components/ungoogled/fingerprint_data.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "net/http/structured_headers.h"
+@@ -369,6 +370,12 @@
+   } else if (platform == "macos") {
+     return kMacOSVersions[seed % std::size(kMacOSVersions)];
+   }
++  if (platform == "android") {
++    // Veil `990`: from the device row the seed picks, so the version and the
++    // model can never disagree (one row, one machine).
++    return ungoogled::android_device::DeviceForSeed(static_cast<uint32_t>(seed))
++        .platform_version;
++  }
+ 
+   return "";
+ }
+@@ -441,6 +448,30 @@
+       metadata->platform = kMacOSPlatform;
+       metadata->platform_version = GetPlatformVersion("macos");
+       metadata->architecture = kArmArchitecture;
++    } else if (platform_value == "android") {
++      // Veil `990`: the phone row. `mobile: true` is what flips Sec-CH-UA-Mobile
++      // and userAgentData.mobile in every path that carries this metadata (both
++      // client_hints.cc and frame_fetch_context.cc call this function).
++      // ARM-Android reports EMPTY architecture and bitness (clearcote 010's
++      // measured shape: a desktop ARM claim says "arm", an Android build ships
++      // neither), and the model/form-factor pair comes from the same row the
++      // version came from.
++      int android_seed = 0;
++      if (command_line->HasSwitch(switches::kFingerprint)) {
++        base::StringToInt(
++            command_line->GetSwitchValueASCII(switches::kFingerprint),
++            &android_seed);
++      }
++      const ungoogled::android_device::AndroidDevice& device =
++          ungoogled::android_device::DeviceForSeed(
++              static_cast<uint32_t>(android_seed));
++      metadata->platform = "Android";
++      metadata->platform_version = GetPlatformVersion("android");
++      metadata->architecture = "";
++      metadata->bitness = "";
++      metadata->mobile = true;
++      metadata->model = device.model;
++      metadata->form_factors = {std::string(blink::kMobileFormFactor)};
+     }
+   }
+ }
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -37,6 +37,10 @@
+     return "Linux x86_64";
+   } else if (custom_platform == "macos") {
+     return "MacIntel";
++  } else if (custom_platform == "android") {
++    // Veil `990`: navigator.platform on a phone -- upstream's own IS_ANDROID
++    // answer, byte-identical, because it is what every Android Chrome reports.
++    return "Linux armv81";
+   }
+ }
+ #if BUILDFLAG(IS_ANDROID)
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -70,6 +70,9 @@
+       return "Linux x86_64";
+     } else if (custom_platform == "macos") {
+       return "MacIntel";
++    } else if (custom_platform == "android") {
++      // Veil `990`: one platform, one spelling -- see navigator_base.cc.
++      return "Linux armv81";
+     }
+   }
+ 
+--- a/components/ungoogled/input_persona.h
++++ b/components/ungoogled/input_persona.h
+@@ -56,6 +56,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/android_device_data.h"
+ #include "components/ungoogled/platform_claim.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ 
+@@ -89,6 +90,19 @@
+   if (claimed == "macos" || claimed == "linux") {
+     return 0;
+   }
++  if (claimed == "android") {
++    // Veil `990`: the phone row's count -- 5 on every device in the table, a
++    // touchscreen phone's multi-touch digitizer. Unlike the desktop rows this
++    // is not a structural constant: it is the ROW's, so it moves with the seed
++    // exactly as the GPU and the model do.
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    uint32_t seed = 0;
++    if (command_line && command_line->HasSwitch(::switches::kFingerprint)) {
++      base::StringToUint(command_line->GetSwitchValueASCII(::switches::kFingerprint),
++                         &seed);
++    }
++    return ungoogled::android_device::DeviceForSeed(seed).max_touch;
++  }
+   return std::nullopt;
+ }
+ 
+--- a/components/ungoogled/display_persona.h
++++ b/components/ungoogled/display_persona.h
+@@ -128,6 +128,14 @@
+ // which is a louder tell than a taskbar.
+ inline WorkArea DeclaredWorkArea(const Panel& panel) {
+   const std::string platform = ClaimedPlatform();
++  if (platform == "android") {
++    // Veil `990`: Android reports the work area equal to the full screen --
++    // Chrome's screen object on a phone carries no persistent shell inset
++    // (clearcote 140's measured shape; what a phone browser subtracts is
++    // window-level, not screen-level). The portrait panel itself arrives by
++    // 960's switches from the launcher.
++    return WorkArea{0, 0, panel.width, panel.height > 1 ? panel.height : 1};
++  }
+   int top = 0;
+   int bottom = 0;
+   if (platform == "macos") {
+--- a/components/ungoogled/voice_persona.h
++++ b/components/ungoogled/voice_persona.h
+@@ -153,8 +153,17 @@
+   if (claimed == "linux") {
+     return true;
+   }
++  if (claimed == "android") {
++    // Veil `990`: a Chrome-on-Android with no bound local TTS engine reports
++    // getVoices() == [] -- the same empty-catalogue shape as the Linux claim,
++    // and never the host's Windows SAPI roster (exactly the leak this header
++    // exists to close). Android's engine-backed voices arrive through Google
++    // services ungoogled does not carry, so an empty catalogue is the honest
++    // phone reading (clearcote 002's own verdict).
++    return true;
++  }
+   if (claimed != "macos") {
+-    // No roster for this claim -- `android` and `ios` reach no patch in this set, and a Windows claim
++    // No roster for this claim -- `ios` reaches no patch in this set, and a Windows claim
+     // on a Windows build is the same-platform case the gate above already returned on.
+     return false;
+   }
+--- a/components/ungoogled/media_persona.h
++++ b/components/ungoogled/media_persona.h
+@@ -151,13 +151,41 @@
+ // kind (`media_devices_manager.cc:1199`) -- so they are named for the claimed machine rather than left
+ // empty, which no real enumeration is.
+ inline const char* ClaimedAudioInputLabel() {
+-  return platform_claim::Claimed() == "macos" ? "MacBook Pro Microphone"
+-                                              : "Built-in Microphone";
++  const std::string claimed = platform_claim::Claimed();
++  if (claimed == "macos") {
++    return "MacBook Pro Microphone";
++  }
++  if (claimed == "android") {
++    // Veil `990`: Chrome on Android reports the built-in mic as "Default"
++    // (clearcote 002's phone roster, and what a phone enumeration carries).
++    return "Default";
++  }
++  return "Built-in Microphone";
+ }
+ 
+ inline const char* ClaimedVideoInputLabel() {
+-  return platform_claim::Claimed() == "macos" ? "FaceTime HD Camera"
+-                                              : "Integrated Camera";
++  const std::string claimed = platform_claim::Claimed();
++  if (claimed == "macos") {
++    return "FaceTime HD Camera";
++  }
++  if (claimed == "android") {
++    // Veil `990`: the back camera, in the "camera2 N, facing ..." label format
++    // Chrome on Android reports. The front camera is the SECOND entry, added by
++    // the manager -- a phone has both, and a single camera is a tell on its own.
++    return "camera2 0, facing back";
++  }
++  return "Integrated Camera";
++}
++
++// The SECOND video entry a phone claims. Absent on the desktop personas: the
++// host's real enumeration is used as-is there, and 969's additive rule adds
++// nothing it does not have to.
++inline bool ClaimedSecondVideoInputLabel(const char** out) {
++  if (!platform_claim::IsAndroidPersona()) {
++    return false;
++  }
++  *out = "camera2 1, facing front";
++  return true;
+ }
+ 
+ }  // namespace media_persona
+--- a/content/browser/web_contents/slow_web_preference_cache.cc
++++ b/content/browser/web_contents/slow_web_preference_cache.cc
+@@ -14,6 +14,7 @@
+ #include "build/blink_buildflags.h"
+ #include "content/public/common/content_switches.h"
+ #include "components/ungoogled/input_persona.h"
++#include "components/ungoogled/platform_claim.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+ #include "ui/base/pointer/pointer_device.h"
+ #include "ui/gl/gpu_switching_manager.h"
+@@ -85,6 +86,33 @@
+   }
+   const bool has_touch = *touch_points > 0;
+   prefs->pointer_events_max_touch_points = *touch_points;
++
++  // Veil `990`: the phone mapping. A touchscreen phone has no fine pointer and
++  // nothing to hover -- (pointer: coarse), (any-pointer: coarse), (hover: none),
++  // (any-hover: none) -- and `ontouchstart` exists, which the desktop build
++  // defaults off. 961's desktop mapping below is Chromium's own desktop
++  // derivation (pointer_device_win.cc's COARSE|FINE beside a FINE primary);
++  // the phone shape is what pointer_device_android.cc answers and this build
++  // does not compile -- so it is written here, once, beside it. The mobile
++  // viewport prefs ride along (clearcote 002's block, ported to the one
++  // browser-side place all of these are written): layout, double-tap zoom and
++  // touch detection follow the claim, while the window geometry itself is the
++  // launcher's --window-size (the T24-b coupling).
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    prefs->available_pointer_types = ui::POINTER_TYPE_COARSE;
++    prefs->primary_pointer_type = blink::mojom::PointerType::kPointerCoarseType;
++    prefs->available_hover_types = ui::HOVER_TYPE_NONE;
++    prefs->primary_hover_type = blink::mojom::HoverType::kHoverNone;
++    prefs->touch_event_feature_detection_enabled = true;
++    prefs->viewport_enabled = true;
++    prefs->viewport_meta_enabled = true;
++    prefs->viewport_style = blink::mojom::ViewportStyle::kMobile;
++    prefs->shrinks_viewport_contents_to_fit = true;
++    prefs->main_frame_resizes_are_orientation_changes = true;
++    prefs->double_tap_to_zoom_enabled = true;
++    return;
++  }
++
+   prefs->available_pointer_types =
+       has_touch ? (ui::POINTER_TYPE_COARSE | ui::POINTER_TYPE_FINE)
+                 : ui::POINTER_TYPE_FINE;
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -5,6 +5,7 @@
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
+ #include "components/ungoogled/display_persona.h"
++#include "components/ungoogled/platform_claim.h"
+ 
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+@@ -383,12 +384,23 @@
+     LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // Veil `990`: the Blink-level belt to 961's braces. 961 writes the input prefs
++  // browser-side into every renderer's WebPreferences and these Calculate*
++  // getters are what a fresh Settings is built from -- if the two ever disagree
++  // (a read before the first cache Load), the phone answers coarse here too.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return mojom::blink::PointerType::kPointerCoarseType;
++  }
+   return frame->GetSettings()->GetPrimaryPointerType();
+ }
+ 
+ int MediaValues::CalculateAvailablePointerTypes(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // Veil `990`: coarse only -- (any-pointer: fine) is false on a phone.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return static_cast<int>(mojom::blink::PointerType::kPointerCoarseType);
++  }
+   return frame->GetSettings()->GetAvailablePointerTypes();
+ }
+ 
+@@ -396,6 +408,10 @@
+     LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // Veil `990`: (hover: none) on a phone.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return mojom::blink::HoverType::kHoverNone;
++  }
+   return frame->GetSettings()->GetPrimaryHoverType();
+ }
+ 
+@@ -409,6 +425,10 @@
+ int MediaValues::CalculateAvailableHoverTypes(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetSettings());
++  // Veil `990`: (any-hover: none) on a phone.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return static_cast<int>(mojom::blink::HoverType::kHoverNone);
++  }
+   return frame->GetSettings()->GetAvailableHoverTypes();
+ }
+ 
+--- a/content/browser/renderer_host/media/media_devices_manager.cc
++++ b/content/browser/renderer_host/media/media_devices_manager.cc
+@@ -1539,6 +1539,16 @@
+       veil_snapshot.emplace_back("veil-builtin-video-input",
+                                  ungoogled::media_persona::ClaimedVideoInputLabel(),
+                                  "veil-builtin-video-group");
++      const char* veil_front_label = nullptr;
++      if (ungoogled::media_persona::ClaimedSecondVideoInputLabel(
++              &veil_front_label)) {
++        // Veil `990`: a phone claims the front camera too. Same additive rule as
++        // 969 -- this branch only runs when the host enumerated NO camera at all
++        // -- and the same one-group-per-device shape, so the two never collapse.
++        veil_snapshot.emplace_back("veil-builtin-video-input-front",
++                                   veil_front_label,
++                                   "veil-builtin-video-group-front");
++      }
+       veil_added = true;
+     }
+   }
+--- a/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc
++++ b/third_party/blink/renderer/modules/webgl/gpu_fingerprint.cc
+@@ -3,6 +3,7 @@
+ #include "base/command_line.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
++#include "components/ungoogled/android_device_data.h"
+ #include "components/ungoogled/fingerprint_data.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "third_party/blink/renderer/modules/webgl/gpu_info.h"
+@@ -33,6 +34,11 @@
+ 
+ // Returns a GL_RENDERER string based on platform and fingerprint
+ std::string GetGLRendererString(const std::string& platform, uint32_t fingerprint) {
++  // Veil `990`: the phone row's ANGLE-wrapped GLES renderer, keyed on the same
++  // seed every other surface reads -- one row, one GPU, no second source.
++  if (platform == "android") {
++    return ungoogled::android_device::DeviceForSeed(fingerprint).gl_renderer;
++  }
+   if (platform == "macos") {
+     // Use helper function to get macOS GPU string
+     return GetMacosGpuString(fingerprint % kMacosGpuModelCount);
+@@ -67,6 +73,14 @@
+     if (command_line->HasSwitch(switches::kFingerprintPlatform)) {
+       platform = base::ToLowerASCII(
+           command_line->GetSwitchValueASCII(switches::kFingerprintPlatform));
++    }
++    // Veil `990`: the phone row's IHV -- the same row the renderer string comes
++    // from, so vendor and renderer cannot disagree (one machine, one GPU).
++    if (platform == "android") {
++      uint32_t seed = 0;
++      base::StringToUint(
++          command_line->GetSwitchValueASCII(switches::kFingerprint), &seed);
++      return ungoogled::android_device::DeviceForSeed(seed).gl_vendor;
+     }
+     return GetGLVendorString(platform);
+   }
+--- a/third_party/blink/renderer/modules/webgl/veil_webgl_caps.h
++++ b/third_party/blink/renderer/modules/webgl/veil_webgl_caps.h
+@@ -67,6 +67,7 @@
+ #include <string>
+ 
+ #include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "components/ungoogled/ungoogled_switches.h"
+ #include "gpu/command_buffer/client/gles2_interface.h"
+@@ -167,6 +168,56 @@
+     .aliased_line_width_max = 1.f,
+ };
+ 
++// ANGLE-on-GLES on a claimed phone. Chrome on Android runs WebGL through ANGLE
++// over the phone's GLES driver, whose limits are the driver's -- not in this
++// tree. The texture quartet is the DEVICE ROW's (16384 flagship / 8192 mid-tier,
++// filled in `Claimed()` below from kAndroidDevices); the rest are the GLES 3.2
++// constants every part in the table honours, each with its source:
++//
++//   vertex_attribs / *_texture_units   the GLES 3.2 spec minima every GLES3 driver
++//                                      meets (spec tables 6.3/6.30): 16 and 16
++//   *_uniform_vectors                  1024 -- what both flagship parts report
++//                                      (webglreport.com captures, Pixel-class)
++//   varying_vectors                    31, what Chrome reports on those parts
++//   *_uniform_blocks / block size      12 / 65536, the flagship reports
++//   draw_buffers / color_attachments   8, the GLES 3.0 minimum both meet
++//   uniform_buffer_offset_alignment    256, the GLES 3.0 minimum, also Mali's
++//   point / line ranges                kept at the live driver's value by the
++//                                      clamp -- the per-part real ranges are the
++//                                      same runtime-query residual class 963
++//                                      already records for MAX_SAMPLES
++//
++// The texture quartet below is the flagship row's 16384 and is overwritten per
++// row in `Claimed()`; it is a placeholder that never reaches a WebGL query
++// unclamped. `.active` is true because a claimed phone is a real GLES target --
++// unlike `linux`/`ios`, where the host's truth is the honest answer.
++inline constexpr Caps kAndroidGLES = {
++    .active = true,
++    .texture_size = 16384,
++    .cube_map_texture_size = 16384,
++    .renderbuffer_size = 16384,
++    .viewport_dim = 16384,
++    .texture_3d_size = 2048,
++    .array_texture_layers = 2048,
++    .vertex_attribs = 16,
++    .vertex_texture_units = 16,
++    .fragment_texture_units = 16,
++    .vertex_uniform_vectors = 1024,
++    .fragment_uniform_vectors = 1024,
++    .vertex_uniform_blocks = 12,
++    .fragment_uniform_blocks = 12,
++    .uniform_block_size = 65536,
++    .varying_vectors = 31,
++    .draw_buffers = 8,
++    .color_attachments = 8,
++    .uniform_buffer_offset_alignment = 256,
++    .texture_lod_bias = 2.f,
++    .aliased_point_size_min = 1.f,
++    .aliased_point_size_max = 1024.f,
++    .aliased_line_width_min = 1.f,
++    .aliased_line_width_max = 1.f,
++};
++
+ // ANGLE's Metal backend on macOS, which is what `011`'s macOS table claims -- every entry there is an
+ // Apple M-series part, so the TARGET_OS_OSX branch is the whole story and no Intel-Mac variant is
+ // needed. Line numbers are DisplayMtl.mm unless marked.
+@@ -247,8 +267,9 @@
+ // An absent platform falls to the D3D11 table rather than to nothing, because that is where `011`
+ // falls: `GetGLRendererStringForFingerprint()` defaults `platform` to "windows", so a seed with no
+ // `--fingerprint-platform` already claims an NVIDIA card and the capabilities have to agree with the
+-// name that is being reported. `linux`, `android` and `ios` return an inactive set -- there is no
+-// fixed table to transcribe for ANGLE's GL backend, and a guess would be worse than the host's truth.
++// name that is being reported. `android` claims kAndroidGLES below (990). `linux` and `ios` return
++// an inactive set -- there is no fixed table to transcribe for ANGLE's GL backend, and a guess
++// would be worse than the host's truth.
+ inline Caps Claimed() {
+   if (!Enabled()) {
+     return Caps();
+@@ -256,6 +277,24 @@
+   const std::string platform = ClaimedPlatform();
+   if (platform == "macos") {
+     return kMacOSMetal;
++  }
++  if (platform == "android") {
++    // Veil `990`: the phone row's ceiling, clamped down by Resolve like every
++    // other table. The texture quartet is per-row; the rest is kAndroidGLES.
++    Caps caps = kAndroidGLES;
++    uint32_t seed = 0;
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    if (command_line && command_line->HasSwitch(::switches::kFingerprint)) {
++      base::StringToUint(
++          command_line->GetSwitchValueASCII(::switches::kFingerprint), &seed);
++    }
++    const ungoogled::android_device::AndroidDevice& device =
++        ungoogled::android_device::DeviceForSeed(seed);
++    caps.texture_size = device.gl_max_texture_size;
++    caps.cube_map_texture_size = device.gl_max_texture_size;
++    caps.renderbuffer_size = device.gl_max_texture_size;
++    caps.viewport_dim = device.gl_max_texture_size;
++    return caps;
+   }
+   if (platform.empty() || platform == "windows") {
+     return kWindowsD3D11;
+--- a/third_party/blink/renderer/modules/battery/battery_manager.cc
++++ b/third_party/blink/renderer/modules/battery/battery_manager.cc
+@@ -13,6 +13,13 @@
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/modules/battery/battery_dispatcher.h"
++
++#include <limits>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "components/ungoogled/android_device_data.h"
++#include "components/ungoogled/platform_claim.h"
+ 
+ namespace blink {
+ 
+@@ -79,19 +86,59 @@
+   return battery_property_->Promise(script_state->World());
+ }
+ 
++namespace {
++
++// Veil `990`: the phone battery claim. 6.18 measured the desktop battery a
++// no-op (every host here reports the AC set) and declined to fabricate a
++// discharge; the android arm is the debt that note recorded -- a phone persona
++// reporting desktop-on-AC forever is the shape 961 removed everywhere else.
++// Constants, not seed-derived, except the level: every discharging phone
++// reports the same shape, and the level is the one field a real phone's user
++// actually varies.
++bool VeilAndroidBatteryPersona() {
++  return ungoogled::platform_claim::IsAndroidPersona();
++}
++
++}  // namespace
++
+ bool BatteryManager::charging() {
++  // A phone persona is on battery (discharging); desktop stays on AC.
++  if (VeilAndroidBatteryPersona()) {
++    return false;
++  }
+   return battery_status_.Charging();
+ }
+ 
+ double BatteryManager::chargingTime() {
++  // Discharging phone: +Infinity per spec; desktop on AC: 0.
++  if (VeilAndroidBatteryPersona()) {
++    return std::numeric_limits<double>::infinity();
++  }
+   return battery_status_.charging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::dischargingTime() {
++  // Phone on battery: a finite, granularity-rounded estimate (3h48m -- a phone
++  // mid-afternoon); desktop no-battery: +Infinity.
++  if (VeilAndroidBatteryPersona()) {
++    return 13680.0;
++  }
+   return battery_status_.discharging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::level() {
++  // Phone: a plausible partial charge, 0.55..0.98 by seed, rounded to 0.01 like
++  // real Chrome; desktop: 1.0 (full, on AC).
++  if (VeilAndroidBatteryPersona()) {
++    const base::CommandLine* command_line = base::CommandLine::ForCurrentProcess();
++    uint32_t seed = 0;
++    if (command_line && command_line->HasSwitch(::switches::kFingerprint)) {
++      base::StringToUint(
++          command_line->GetSwitchValueASCII(::switches::kFingerprint), &seed);
++    }
++    return (55 + static_cast<int>(ungoogled::android_device::MixSeed(seed) % 44)) /
++           100.0;
++  }
+   return battery_status_.Level();
+ }
+ 
+--- a/third_party/blink/renderer/modules/netinfo/network_information.cc
++++ b/third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -7,6 +7,8 @@
+ #include <algorithm>
+ 
+ #include "base/time/time.h"
++
++#include "components/ungoogled/platform_claim.h"
+ #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_connection_type.h"
+@@ -87,6 +89,13 @@
+   if (RuntimeEnabledFeatures::NetInfoConstantTypeEnabled()) {
+     return V8ConnectionType(V8ConnectionType::Enum::kUnknown);
+   }
++  // Veil `990`: the phone claims a wifi link. `type` is web-exposed only where
++  // Chromium exposes it (the NetInfoDownlinkMax shape, Android/ChromeOS); on this
++  // desktop binary the attribute is inert, but the value is coherent if a build
++  // flips the feature -- the host's ethernet answer is what would leak.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return V8ConnectionType(V8ConnectionType::Enum::kWifi);
++  }
+ 
+   // type_ is only updated when listening for events, so ask
+   // networkStateNotifier if not listening (crbug.com/379841).
+@@ -118,6 +127,12 @@
+     return V8EffectiveConnectionType(
+         EffectiveConnectionTypeToEnum(override_ect.value()));
+   }
++  // Veil `990`: a phone on wifi reports 4g. Constants: the claim is the machine,
++  // not the link quality, and a fabricated value that drifted per launch would be
++  // the second source 6.9 forbids.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return V8EffectiveConnectionType(V8EffectiveConnectionType::Enum::k4G);
++  }
+ 
+   // effective_type_ is only updated when listening for events, so ask
+   // networkStateNotifier if not listening (crbug.com/379841).
+@@ -137,6 +152,10 @@
+       GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
+   if (override_rtt) {
+     return GetNetworkStateNotifier().RoundRtt(Host(), override_rtt.value());
++  }
++  // Veil `990`: 50 ms -- a healthy wifi link, constant with effectiveType 4g.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return 50;
+   }
+ 
+   if (!IsObserving()) {
+@@ -154,6 +173,10 @@
+   if (override_downlink_mbps) {
+     return GetNetworkStateNotifier().RoundMbps(Host(),
+                                                override_downlink_mbps.value());
++  }
++  // Veil `990`: 10 Mbps, the value Chrome rounds a healthy wifi link to.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return 10.0;
+   }
+ 
+   if (!IsObserving()) {
+--- a/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
++++ b/third_party/blink/renderer/modules/plugins/dom_plugin_array.cc
+@@ -18,6 +18,7 @@
+  *  MA 02110-1301 USA
+  */
+ 
++#include "components/ungoogled/platform_claim.h"
+ #include "third_party/blink/renderer/modules/plugins/dom_plugin_array.h"
+ 
+ #include "third_party/blink/public/common/features.h"
+@@ -135,6 +136,13 @@
+ }
+ 
+ bool DOMPluginArray::IsPdfViewerAvailable() {
++  // Veil `990`: a phone persona ships no PDF-viewer plugin -- one gate empties
++  // navigator.plugins, navigator.mimeTypes and pdfViewerEnabled together, which
++  // is exactly the shape `plugins-are-the-spec-pdf-set-or-none` already scores as
++  // a legal machine (6.20). clearcote 002's mobile hunk, on the android claim.
++  if (ungoogled::platform_claim::IsAndroidPersona()) {
++    return false;
++  }
+   auto* data = GetPluginData();
+   if (!data)
+     return false;

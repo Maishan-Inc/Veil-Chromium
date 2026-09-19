@@ -51,3 +51,4 @@ veil/984-webrtc-mdns-hostnames.patch
 veil/970-geolocation-persona.patch
 veil/971-keyboard-layout-persona.patch
 veil/966-farble-per-origin.patch
+veil/990-android-platform.patch
