@@ -128,7 +128,7 @@ jobs:
           gh release upload "$TAG" measured.txt#SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Attest build provenance for the release assets
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.zip
