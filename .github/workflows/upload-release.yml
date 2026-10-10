@@ -96,7 +96,7 @@ jobs:
             echo "::error::release ${TAG} is not a draft — refusing to touch it"
             exit 1
           fi
-          assets=$(jq -r '.assets[] | select(name | endswith(".zip") or endswith(".exe")) | .name' <<<"$release_json")
+          assets=$(jq -r '.assets[] | select(.name | endswith(".zip") or endswith(".exe")) | .name' <<<"$release_json")
           if [ -z "$assets" ]; then
             echo "::error::no zip/installer assets on the draft release"
             exit 1
