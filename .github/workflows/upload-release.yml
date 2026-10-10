@@ -133,7 +133,10 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" measured.txt#SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          # gh's `file#name` rename form did not take effect in practice (measured 2026-10-10:
+          # the asset landed on the release as `measured.txt`), so name the file itself.
+          cp measured.txt SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Attest build provenance for the release assets
         uses: actions/attest-build-provenance@v1
